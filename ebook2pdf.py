@@ -262,30 +262,37 @@ def capture_pages(box, win, args):
     print()
 
     images = []
-    prev_fp = None
-    repeats = 0
-
     with mss.mss() as sct:
-        for page in range(1, args.pages + 1):
-            img = grab(sct, box)
-            fp = image_fingerprint(img)
+        img = grab(sct, box)
+        images.append(img)
+        seen = {image_fingerprint(img)}
+        print("Captured page 1", end="\r", flush=True)
 
-            if fp == prev_fp:
-                repeats += 1
-                print(f"Page {page}: identical to previous capture "
-                      f"({repeats}/{args.stop_after_repeats}).")
-                if repeats >= args.stop_after_repeats:
-                    print("Reached the last page — stopping.")
-                    break
-            else:
-                repeats = 0
-                images.append(img)
-                print(f"Captured page {len(images)}", end="\r", flush=True)
-            prev_fp = fp
-
-            if page < args.pages:
+        while len(images) < args.pages:
+            # Turn the page; if the screen doesn't change (slow render,
+            # dropped keystroke) retry with a longer wait each time. Only
+            # after every attempt fails is it the end of the book. The
+            # fingerprint set guarantees no page is captured twice.
+            new_img = None
+            for attempt in range(1, args.turn_retries + 1):
                 pyautogui.press(args.key)
-                time.sleep(args.delay)
+                time.sleep(args.delay * attempt)
+                candidate = grab(sct, box)
+                fp = image_fingerprint(candidate)
+                if fp not in seen:
+                    new_img = candidate
+                    seen.add(fp)
+                    break
+                if attempt < args.turn_retries:
+                    print(f"\nPage unchanged after turn (attempt {attempt}/"
+                          f"{args.turn_retries}) — retrying with a longer "
+                          "wait...")
+            if new_img is None:
+                print(f"\nPage still unchanged after {args.turn_retries} "
+                      "attempts — reached the end of the book.")
+                break
+            images.append(new_img)
+            print(f"Captured page {len(images)}", end="\r", flush=True)
 
     print(f"\nCaptured {len(images)} unique pages.")
     if not images:
@@ -744,13 +751,21 @@ def build_text_pdf(paragraphs, output, fmt=None):
         topMargin=margin, bottomMargin=margin,
     )
     story = []
+    prev_kind = None
     for para in paragraphs:
         if para == "\f":
             story.append(PageBreak())
+            prev_kind = None
             continue
         if isinstance(para, str):
             para = {"kind": "body", "markup": _esc(para)}
+        # chapters start on a fresh page: break before an h1 that follows
+        # body text (but not between consecutive heading lines, and not
+        # at the very start of the document)
+        if para["kind"] == "h1" and prev_kind == "body":
+            story.append(PageBreak())
         story.append(Paragraph(para["markup"], styles[para["kind"]]))
+        prev_kind = para["kind"]
     doc.build(story)
 
 
@@ -818,8 +833,9 @@ def parse_args():
     p.add_argument("--start-delay", type=int, default=5,
                    help="countdown before capture starts so you can focus "
                         "the reader window (default 5)")
-    p.add_argument("--stop-after-repeats", type=int, default=2,
-                   help="stop after N consecutive identical captures (default 2)")
+    p.add_argument("--turn-retries", type=int, default=3,
+                   help="attempts per page turn before concluding the book "
+                        "ended; the wait grows with each attempt (default 3)")
     p.add_argument("--lang", default="eng",
                    help="Tesseract language code(s), e.g. eng, deu, eng+fra")
     p.add_argument("--save-text", metavar="FILE",

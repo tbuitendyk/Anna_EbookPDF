@@ -3,9 +3,12 @@
 Convert on-screen digital text (e-book readers, document viewers, web pages)
 into a PDF using **screen capture + OCR**. You pick the window that shows the
 text; the tool captures each page, sends a keystroke to turn the page
-automatically, and stops by itself when it detects the last page (two
-identical captures in a row). All pages are then assembled into a PDF with
-[pytesseract](https://github.com/madmaze/pytesseract).
+automatically, and stops by itself at the end of the book. A slow or dropped
+page turn is retried (3 attempts with a growing wait) before the tool
+concludes the book is finished, and captured fingerprints guarantee no page
+appears twice. All pages are then assembled into a PDF with
+[pytesseract](https://github.com/madmaze/pytesseract). In the default text
+mode each chapter starts on a fresh page, matching the source book.
 
 > Only use this on content you have the right to copy (your own documents,
 > public-domain or DRM-free material, personal backups where permitted).
@@ -90,7 +93,7 @@ customize page size, orientation, font size, line spacing, and margins. Pass
 | `--key KEY`             | `right`      | Page-turn key: `right`, `pagedown`, `space`, ...     |
 | `--delay SEC`           | 1.5          | Wait after each page turn (raise for slow readers)   |
 | `--start-delay SEC`     | 5            | Countdown before capture starts                      |
-| `--stop-after-repeats N`| 2            | Stop after N identical captures in a row             |
+| `--turn-retries N`      | 3            | Attempts per page turn (growing wait) before ending  |
 | `--page-size SIZE`      | ask/`a4`     | Text mode page size: `a4` or `letter`                |
 | `--orientation O`       | ask/`portrait` | Text mode: `portrait` or `landscape`               |
 | `--font-size PT`        | ask/`11`     | Text mode body font size in points                   |
