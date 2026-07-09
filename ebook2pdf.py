@@ -399,23 +399,45 @@ def parse_args():
     return p.parse_args()
 
 
+# Common install locations checked when tesseract is not on PATH.
+TESSERACT_DEFAULT_PATHS = [
+    r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+    r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+    os.path.expandvars(r"%LOCALAPPDATA%\Programs\Tesseract-OCR\tesseract.exe"),
+    "/usr/local/bin/tesseract",
+    "/opt/homebrew/bin/tesseract",
+]
+
+
+def configure_tesseract(explicit_cmd=None):
+    """Point pytesseract at a tesseract binary: --tesseract-cmd flag,
+    TESSERACT_CMD env var, PATH, then common install locations."""
+    import pytesseract
+
+    candidates = [explicit_cmd, os.environ.get("TESSERACT_CMD"), None]
+    candidates += TESSERACT_DEFAULT_PATHS
+    for cmd in candidates:
+        if cmd is not None and not os.path.isfile(cmd):
+            continue
+        if cmd is not None:
+            pytesseract.pytesseract.tesseract_cmd = cmd
+        try:
+            pytesseract.get_tesseract_version()
+            return
+        except Exception:
+            continue
+    sys.exit(
+        "Tesseract OCR engine not found. Install it "
+        "(https://tesseract-ocr.github.io/tessdoc/Installation.html) "
+        "or pass --tesseract-cmd /path/to/tesseract."
+    )
+
+
 def main():
     args = parse_args()
 
-    if args.tesseract_cmd:
-        import pytesseract
-        pytesseract.pytesseract.tesseract_cmd = args.tesseract_cmd
-
     if args.mode in ("searchable", "text"):
-        import pytesseract
-        try:
-            pytesseract.get_tesseract_version()
-        except Exception:
-            sys.exit(
-                "Tesseract OCR engine not found. Install it "
-                "(https://tesseract-ocr.github.io/tessdoc/Installation.html) "
-                "or pass --tesseract-cmd /path/to/tesseract."
-            )
+        configure_tesseract(args.tesseract_cmd)
 
     # --- choose the capture region -----------------------------------------
     win = None

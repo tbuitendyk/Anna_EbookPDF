@@ -86,7 +86,7 @@ keystrokes. To abort mid-capture, slam the mouse into any screen corner
 | `--lang CODE`           | `eng`        | Tesseract language(s), e.g. `eng`, `deu`, `eng+fra`  |
 | `--save-text FILE`      | —            | Also dump the OCR text to a file                     |
 | `--save-images DIR`     | —            | Also save every captured page as PNG                 |
-| `--tesseract-cmd PATH`  | —            | Tesseract executable if not on PATH                  |
+| `--tesseract-cmd PATH`  | auto         | Tesseract executable. If omitted, the tool checks the `TESSERACT_CMD` env var, PATH, then common install locations (incl. `C:\Program Files\Tesseract-OCR\tesseract.exe`) |
 
 ## Tips for good OCR
 
