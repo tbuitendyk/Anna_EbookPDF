@@ -68,7 +68,7 @@ keystrokes. To abort mid-capture, slam the mouse into any screen corner
 
 | Mode         | Result                                                                 |
 |--------------|------------------------------------------------------------------------|
-| `text`       | **Default.** OCR text re-flowed onto clean standard pages. Running headers/footers and reader chrome (page counters, progress %) are stripped, and paragraphs that continue across a page turn are joined so the text flows naturally. Source formatting is matched where possible: chapter numbers and titles become large centered headings (detected from their relative text size) and italic passages stay italic (detected from glyph slant). Use `--keep-page-breaks` to preserve the original page boundaries instead. |
+| `text`       | **Default.** OCR text re-flowed onto clean standard pages. Running headers/footers and reader chrome (page counters, progress %) are stripped, and paragraphs that continue across a page turn are joined so the text flows naturally. Source formatting is matched where possible: chapter numbers and titles become large centered headings (detected from their relative text size), italic passages stay italic (detected from glyph slant), and intentional line breaks — title/subtitle lines, place-and-date blocks, verse — are kept, since a line that stops well short of the right margin mid-paragraph was broken on purpose. Use `--keep-page-breaks` to preserve the original page boundaries instead. |
 | `searchable` | Page images with an invisible OCR text layer — looks identical to the source, but text is selectable/searchable. |
 | `image`      | Page images only, no OCR.                                               |
 

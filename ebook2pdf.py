@@ -341,6 +341,11 @@ BARE_NUMBER_PATTERN = re.compile(r"^[\s•·|.\-–—\d%:]+$")
 # lean 10-15 degrees (tangent 0.18-0.27).
 ITALIC_SHEARS = [0.15, 0.20, 0.25, 0.30]
 
+# Slant can only be measured on letters with vertical stems. A word made
+# entirely of round/diagonal letterforms ("way", "eyes", "see") gives a
+# noise answer, so it stays undecided and inherits from its neighbors.
+_VERTICAL_STEM_CHARS = set("bdfhijklmnpqrtu" "BDEFHIJKLMNPRTU" "14")
+
 
 def _norm_line(line):
     return re.sub(r"\s+", " ", line.strip().lower())
@@ -385,6 +390,9 @@ def _word_italic(img):
     ratio = italic / upright
     # Calibrated on rendered serif/sans/mono text: upright words score
     # 0.80-1.00, italic words 1.01-1.18, round-letterform words ~1.00.
+    # Only confident calls decide; the wide ambiguous band in between
+    # inherits from neighboring words, which lets weak italics join a
+    # surrounding italic run without letting them fire on their own.
     if ratio > 1.04:
         return True
     if ratio < 0.96:
@@ -464,12 +472,12 @@ def extract_structured(images, lang):
             key = (d["block_num"][j], d["par_num"][j])
             paras.setdefault(key, {}).setdefault(d["line_num"][j], []).append(j)
 
-        page_paras = []
+        raw_paras = []
         for key, lines in paras.items():
-            plain_lines, markup_lines, word_heights = [], [], []
-            left = right = None
+            line_recs = []
             for ln in sorted(lines):
-                texts, flags = [], []
+                texts, flags, heights = [], [], []
+                left = right = None
                 for j in lines[ln]:
                     text = d["text"][j].strip()
                     box = (d["left"][j], d["top"][j],
@@ -477,39 +485,72 @@ def extract_structured(images, lang):
                            d["top"][j] + d["height"][j])
                     left = box[0] if left is None else min(left, box[0])
                     right = box[2] if right is None else max(right, box[2])
-                    # short words are unreliable for slant detection (None);
-                    # they inherit from their neighbors below
+                    # short words and words without vertical stems are
+                    # unreliable for slant detection (None); they inherit
+                    # from their neighbors below
                     italic = (None if len(text) < 3
+                              or not set(text) & _VERTICAL_STEM_CHARS
                               else _word_italic(img.crop(box)))
                     texts.append(_esc(text))
                     flags.append(italic)
                     if len(text) >= 2:
-                        word_heights.append(d["height"][j])
+                        heights.append(d["height"][j])
                 for k, f in enumerate(flags):
                     if f is None:
                         prev = next((flags[m] for m in range(k - 1, -1, -1)
                                      if flags[m] is not None), None)
                         nxt = next((flags[m] for m in range(k + 1, len(flags))
                                     if flags[m] is not None), None)
-                        if prev is None:
-                            flags[k] = bool(nxt)
-                        elif nxt is None:
-                            flags[k] = prev
-                        else:
-                            flags[k] = prev and nxt
-                words = list(zip(texts, flags))
-                plain_lines.append(" ".join(texts))
-                markup_lines.append(_line_markup(words))
-            plain = _join_lines(plain_lines)
-            markup = _join_lines(markup_lines)
-            if not plain.strip():
-                continue
+                        # lean italic: a short word joins an italic run when
+                        # either determined neighbor is italic
+                        flags[k] = bool(prev) or bool(nxt)
+                if not texts:
+                    continue
+                line_recs.append({
+                    "plain": " ".join(texts),
+                    "markup": _line_markup(list(zip(texts, flags))),
+                    "left": left, "right": right, "heights": heights,
+                })
+            if line_recs:
+                raw_paras.append(line_recs)
 
-            ratio = ((statistics.median(word_heights) / body_height)
-                     if word_heights else 1.0)
-            page_paras.append({"kind": "body", "plain": plain,
-                               "markup": markup, "_ratio": ratio,
-                               "_left": left, "_right": right})
+        # The right margin of the text column: justified wrapped lines
+        # reach it, so a line ending well short of it is an intentional
+        # break (heading lines, place/date blocks, verse) — split there.
+        page_paras = []
+        if raw_paras:
+            col_right = max(r["right"] for lr in raw_paras for r in lr)
+            col_left = min(r["left"] for lr in raw_paras for r in lr)
+            short_cut = col_right - 0.15 * max(col_right - col_left, 1)
+
+        for line_recs in raw_paras:
+            segments, current = [], []
+            for i, rec in enumerate(line_recs):
+                current.append(rec)
+                is_last = i == len(line_recs) - 1
+                if not is_last and rec["right"] < short_cut:
+                    segments.append(current)
+                    current = []
+            if current:
+                segments.append(current)
+
+            for seg in segments:
+                plain = _join_lines([r["plain"] for r in seg])
+                markup = _join_lines([r["markup"] for r in seg])
+                if not plain.strip():
+                    continue
+                heights = [h for r in seg for h in r["heights"]]
+                ratio = ((statistics.median(heights) / body_height)
+                         if heights else 1.0)
+                page_paras.append({
+                    "kind": "body", "plain": plain, "markup": markup,
+                    # a paragraph whose final line stops short is complete —
+                    # never merge it with the next page
+                    "ends_short": seg[-1]["right"] < short_cut,
+                    "_ratio": ratio,
+                    "_left": min(r["left"] for r in seg),
+                    "_right": max(r["right"] for r in seg),
+                })
 
         # Headings must be larger than body text AND centered on the page —
         # a lone tall-glyphed word at the paragraph indent ("Tidy?") is
@@ -594,6 +635,8 @@ def reflow_paragraphs(pages, keep_page_breaks=False):
                 and prev is not None
                 and prev["kind"] == "body"
                 and p["kind"] == "body"
+                # a short final line means the paragraph ended on that page
+                and not prev.get("ends_short")
                 and (
                     prev["plain"].endswith("-")
                     or not prev["plain"].endswith(_TERMINAL)
@@ -602,6 +645,7 @@ def reflow_paragraphs(pages, keep_page_breaks=False):
             )
             if continues_previous:
                 _merge_paragraphs(prev, p)
+                prev["ends_short"] = p.get("ends_short", False)
             else:
                 out.append(dict(p))
     return out
