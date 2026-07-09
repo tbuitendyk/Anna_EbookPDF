@@ -36,12 +36,15 @@ Platform notes:
 ## Usage
 
 ```bash
-# Interactive: lists all open windows, you pick the one with the text.
-# Captures pages until the page stops changing, builds output.pdf
+# Fully interactive: asks whether to pick a window or drag-select a region,
+# then asks for a page count (or press Enter to scan to the end of the book)
 python ebook2pdf.py -o book.pdf
 
 # Match a window by title, capture at most 120 pages
 python ebook2pdf.py --window kindle --pages 120 -o book.pdf
+
+# Scan to the end of the book with no prompts
+python ebook2pdf.py --window kindle --to-end -o book.pdf
 
 # Drag a rectangle around just the text area; turn pages with the space bar
 python ebook2pdf.py --select-region --key space -o book.pdf
@@ -74,7 +77,8 @@ keystrokes. To abort mid-capture, slam the mouse into any screen corner
 | `--window TITLE`        | —            | Capture first window whose title contains TITLE      |
 | `--select-region`       | —            | Drag-select the capture area on screen               |
 | `--region X,Y,W,H`      | —            | Explicit capture rectangle                           |
-| `--pages N`             | 1000         | Maximum pages (auto-stops at the last page anyway)   |
+| `--pages N`             | ask          | Capture at most N pages (auto-stops early at the last page) |
+| `--to-end`              | ask          | Scan until the end of the book, no page-count prompt |
 | `--key KEY`             | `right`      | Page-turn key: `right`, `pagedown`, `space`, ...     |
 | `--delay SEC`           | 1.5          | Wait after each page turn (raise for slow readers)   |
 | `--start-delay SEC`     | 5            | Countdown before capture starts                      |

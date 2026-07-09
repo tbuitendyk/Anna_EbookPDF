@@ -20,11 +20,15 @@ Requires the Tesseract OCR engine to be installed on the system
 (https://tesseract-ocr.github.io/tessdoc/Installation.html).
 
 Examples:
-  # Interactive: list windows, pick one, capture until last page
+  # Fully interactive: asks window-picker vs drag-select, then asks
+  # for a page count (or Enter to scan to the end of the book)
   python ebook2pdf.py -o book.pdf
 
-  # Capture exactly 120 pages from a window whose title contains "Kindle"
+  # Capture up to 120 pages from a window whose title contains "Kindle"
   python ebook2pdf.py --window kindle --pages 120 -o book.pdf
+
+  # Scan to the end of the book without any prompts
+  python ebook2pdf.py --window kindle --to-end -o book.pdf
 
   # Drag-select a region of the screen, advance with the space bar
   python ebook2pdf.py --select-region --key space -o book.pdf
@@ -42,6 +46,10 @@ import tempfile
 import time
 
 from PIL import Image
+
+# Safety cap for end-of-book mode, which normally stops via
+# identical-page detection long before this many captures.
+END_OF_BOOK_CAP = 10000
 
 # ---------------------------------------------------------------------------
 # Region / window selection
@@ -87,6 +95,38 @@ def pick_window_interactive():
         except ValueError:
             pass
         print("Invalid choice, try again.")
+
+
+def choose_source_interactive():
+    """Ask the user whether to pick a window or drag-select a region."""
+    print("\nHow do you want to choose the capture area?")
+    print("  [1] Pick an open window from a list")
+    print("  [2] Drag-select a region of the screen")
+    while True:
+        choice = input("Choice [1]: ").strip() or "1"
+        if choice == "1":
+            return pick_window_interactive()
+        if choice == "2":
+            return select_region_with_mouse(), None
+        print("Enter 1 or 2.")
+
+
+def choose_page_count_interactive():
+    """Ask for a page count; blank means scan to the end of the book."""
+    while True:
+        raw = input(
+            "\nHow many pages should be captured? "
+            "(enter a number, or press Enter to scan to the end of the book): "
+        ).strip()
+        if not raw:
+            return None
+        try:
+            n = int(raw)
+            if n > 0:
+                return n
+        except ValueError:
+            pass
+        print("Enter a positive number, or leave blank for end-of-book.")
 
 
 def find_window_by_title(fragment):
@@ -330,9 +370,14 @@ def parse_args():
                    default="searchable",
                    help="searchable: images + invisible OCR text layer (default); "
                         "text: re-flowed OCR text; image: images only")
-    p.add_argument("--pages", type=int, default=1000,
-                   help="maximum pages to capture (default 1000; auto-stops "
-                        "when the page no longer changes)")
+    count = p.add_mutually_exclusive_group()
+    count.add_argument("--pages", type=int, default=None,
+                       help="capture at most N pages (still auto-stops early "
+                            "if the page no longer changes)")
+    count.add_argument("--to-end", action="store_true",
+                       help="scan until the end of the book (stops when the "
+                            "page no longer changes); skips the interactive "
+                            "page-count prompt")
     p.add_argument("--key", default="right",
                    help="key sent to turn the page: right, pagedown, space, "
                         "down, enter... (default: right)")
@@ -385,7 +430,17 @@ def main():
     elif args.window:
         box, win = find_window_by_title(args.window)
     else:
-        box, win = pick_window_interactive()
+        box, win = choose_source_interactive()
+
+    # --- decide how many pages ----------------------------------------------
+    if args.pages is None and not args.to_end:
+        args.pages = choose_page_count_interactive()
+    if args.pages is None:  # end-of-book: rely on identical-page detection
+        args.pages = END_OF_BOOK_CAP
+        print("Scanning until the end of the book "
+              "(stops when the page no longer changes).")
+    else:
+        print(f"Capturing up to {args.pages} pages.")
 
     # --- capture ------------------------------------------------------------
     images = capture_pages(box, win, args)
