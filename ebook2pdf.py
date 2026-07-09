@@ -1093,8 +1093,10 @@ def build_text_pdf(paragraphs, output, fmt=None, book=None):
         title=book.get("title") or None,
         author=book.get("author") or None,
     )
-    frame_w = page[0] - 2 * margin
-    frame_h = page[1] - 2 * margin
+    # the usable frame is smaller than page-minus-margins: reportlab frames
+    # carry 6pt of internal padding on every side
+    frame_w = page[0] - 2 * margin - 12
+    frame_h = page[1] - 2 * margin - 12
     story = []
 
     # --- cover page ---------------------------------------------------------
@@ -1178,8 +1180,6 @@ def build_text_pdf(paragraphs, output, fmt=None, book=None):
             buf = io.BytesIO()
             pil.save(buf, "PNG")
             buf.seek(0)
-            frame_w = page[0] - 2 * margin
-            frame_h = page[1] - 2 * margin
             zoom = min(frame_w / pil.width, frame_h * 0.85 / pil.height, 1.0)
             flow = RLImage(buf, width=pil.width * zoom,
                            height=pil.height * zoom)
