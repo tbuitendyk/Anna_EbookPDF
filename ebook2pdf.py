@@ -366,6 +366,16 @@ def _norm_line(line):
     return re.sub(r"\s+", " ", line.strip().lower())
 
 
+def _italic_fraction(markup):
+    """Fraction of a paragraph's text that sits inside <i> runs."""
+    total = len(re.sub(r"<[^>]+>", "", markup))
+    if not total:
+        return 0.0
+    italic = sum(len(re.sub(r"<[^>]+>", "", m))
+                 for m in re.findall(r"<i>(.*?)</i>", markup))
+    return italic / total
+
+
 def _esc(text):
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
@@ -773,8 +783,21 @@ def extract_structured(images, lang):
             elif p["_centered"] and len(plain) < 80:
                 if p["_ratio"] >= 1.7:
                     p["kind"] = "h1"
-                elif p["_ratio"] >= 1.25 and not in_centered_run(idx):
-                    p["kind"] = "h2"
+                elif p["_ratio"] >= 1.25:
+                    # A short line directly under a chapter title/label is a
+                    # subtitle — heading-group position outranks the checks
+                    # below. Otherwise: italic glyph boxes run tall (slant +
+                    # ascenders), inflating the size ratio, so mostly-italic
+                    # centered lines (thoughts, epigraphs) stay body, as do
+                    # lines sitting inside a centered block (poems).
+                    prev_kind = next(
+                        (page_paras[n]["kind"] for n in range(idx - 1, -1, -1)
+                         if page_paras[n]["kind"] != "image"), None)
+                    if prev_kind in ("h1", "label") and len(plain) < 30:
+                        p["kind"] = "h2"
+                    elif (not in_centered_run(idx)
+                            and _italic_fraction(p["markup"]) <= 0.6):
+                        p["kind"] = "h2"
             # centered text that isn't a heading (poems, epigraphs,
             # dedications) keeps its centering in the output
             if p["kind"] == "body" and p["_centered"]:
@@ -1221,7 +1244,6 @@ def build_epub(paragraphs, output, book=None, lang="eng"):
         bk.add_item(tp)
         chapters.append(tp)
 
-    pic_n = 0
     for k, (name, paras) in enumerate(sections, 1):
         html = []
         for para in paras:
@@ -1229,14 +1251,7 @@ def build_epub(paragraphs, output, book=None, lang="eng"):
                 continue
             kind = para["kind"]
             if kind == "image":
-                pic_n += 1
-                buf = io.BytesIO()
-                para["image"].save(buf, "PNG")
-                fn = f"images/pic{pic_n}.png"
-                bk.add_item(epub.EpubItem(
-                    uid=f"pic{pic_n}", file_name=fn,
-                    media_type="image/png", content=buf.getvalue()))
-                html.append(f'<div class="pic"><img src="{fn}" alt=""/></div>')
+                continue  # only the cover image goes into the EPUB
             elif kind == "h1":
                 html.append(f"<h1>{para['markup']}</h1>")
             elif kind == "h2":
