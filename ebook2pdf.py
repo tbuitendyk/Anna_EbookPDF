@@ -337,9 +337,9 @@ CHROME_PATTERNS = [
 # where reader page counters live; at the top they may be chapter numbers.
 BARE_NUMBER_PATTERN = re.compile(r"^[\s•·|.\-–—\d%:]+$")
 
-# A word image whose glyph slant exceeds this (tangent of the lean angle,
-# ~7 degrees) is treated as italic. Typical italics lean 10-15 degrees.
-ITALIC_SLANT_THRESHOLD = 0.12
+# Shear angles (tangents) treated as italic candidates. Typical italics
+# lean 10-15 degrees (tangent 0.18-0.27).
+ITALIC_SHEARS = [0.15, 0.20, 0.25, 0.30]
 
 
 def _norm_line(line):
@@ -350,36 +350,46 @@ def _esc(text):
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
-_SLANT_CANDIDATES = [i / 20 for i in range(-6, 7)]  # tangents -0.30..0.30
+def _shear_energy(ink, cy, t):
+    """Sharpness of the vertical projection after shearing ink by t."""
+    cols = {}
+    for x, y in ink:
+        c = int(x + t * (y - cy))
+        cols[c] = cols.get(c, 0) + 1
+    return sum(n * n for n in cols.values())
 
 
-def _word_slant(img):
-    """Estimate the slant (tangent of lean angle) of glyphs in a word image.
+def _word_italic(img):
+    """Classify a word image as italic (True), upright (False), or
+    ambiguous (None — the caller lets it inherit from its neighbors).
 
-    Shears the ink at a range of candidate angles and returns the angle
-    whose vertical projection profile is sharpest — upright text peaks at
-    ~0, italics at ~0.2 (about 12 degrees)."""
+    Compares the sharpness of the vertical stroke profile upright vs
+    sheared back by typical italic angles: genuinely italic words get
+    much sharper when counter-sheared, genuinely upright words get worse,
+    and words made of round letterforms with no strong verticals ("see",
+    "eyes") land in between and stay undecided."""
     g = img.convert("L")
     w, h = g.size
     if w < 4 or h < 8:
-        return 0.0
+        return None
     data = g.tobytes()
     ink = [(i % w, i // w) for i, v in enumerate(data) if v < 160]
     if len(ink) < 30:
-        return 0.0
+        return None
 
     cy = h / 2
-    best_t, best_energy = 0.0, -1.0
-    for t in _SLANT_CANDIDATES:
-        cols = {}
-        for x, y in ink:
-            # shear right-leaning glyphs back upright around the midline
-            c = int(x + t * (y - cy))
-            cols[c] = cols.get(c, 0) + 1
-        energy = sum(n * n for n in cols.values())
-        if energy > best_energy:
-            best_energy, best_t = energy, t
-    return best_t
+    upright = _shear_energy(ink, cy, 0.0)
+    if upright <= 0:
+        return None
+    italic = max(_shear_energy(ink, cy, t) for t in ITALIC_SHEARS)
+    ratio = italic / upright
+    # Calibrated on rendered serif/sans/mono text: upright words score
+    # 0.80-1.00, italic words 1.01-1.18, round-letterform words ~1.00.
+    if ratio > 1.04:
+        return True
+    if ratio < 0.96:
+        return False
+    return None
 
 
 def _line_markup(words):
@@ -457,6 +467,7 @@ def extract_structured(images, lang):
         page_paras = []
         for key, lines in paras.items():
             plain_lines, markup_lines, word_heights = [], [], []
+            left = right = None
             for ln in sorted(lines):
                 texts, flags = [], []
                 for j in lines[ln]:
@@ -464,11 +475,12 @@ def extract_structured(images, lang):
                     box = (d["left"][j], d["top"][j],
                            d["left"][j] + d["width"][j],
                            d["top"][j] + d["height"][j])
-                    # short words are too small for slant detection (None);
+                    left = box[0] if left is None else min(left, box[0])
+                    right = box[2] if right is None else max(right, box[2])
+                    # short words are unreliable for slant detection (None);
                     # they inherit from their neighbors below
-                    italic = (None if len(text) < 3 else
-                              _word_slant(img.crop(box))
-                              > ITALIC_SLANT_THRESHOLD)
+                    italic = (None if len(text) < 3
+                              else _word_italic(img.crop(box)))
                     texts.append(_esc(text))
                     flags.append(italic)
                     if len(text) >= 2:
@@ -495,13 +507,25 @@ def extract_structured(images, lang):
 
             ratio = ((statistics.median(word_heights) / body_height)
                      if word_heights else 1.0)
-            if ratio >= 1.7 and len(plain) < 80:
-                kind = "h1"
-            elif ratio >= 1.25 and len(plain) < 80:
-                kind = "h2"
-            else:
-                kind = "body"
-            page_paras.append({"kind": kind, "plain": plain, "markup": markup})
+            page_paras.append({"kind": "body", "plain": plain,
+                               "markup": markup, "_ratio": ratio,
+                               "_left": left, "_right": right})
+
+        # Headings must be larger than body text AND centered on the page —
+        # a lone tall-glyphed word at the paragraph indent ("Tidy?") is
+        # body text, not a heading.
+        page_center = img.width / 2
+        for p in page_paras:
+            center = (p["_left"] + p["_right"]) / 2
+            width = p["_right"] - p["_left"]
+            centered = (abs(center - page_center) < 0.05 * img.width
+                        and width < 0.7 * img.width)
+            if centered and len(p["plain"]) < 80:
+                if p["_ratio"] >= 1.7:
+                    p["kind"] = "h1"
+                elif p["_ratio"] >= 1.25:
+                    p["kind"] = "h2"
+            del p["_ratio"], p["_left"], p["_right"]
         pages.append(page_paras)
     return pages
 
