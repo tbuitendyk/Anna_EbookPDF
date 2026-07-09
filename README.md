@@ -80,11 +80,25 @@ In text mode you are offered the formatting defaults (A4 portrait, 11 pt font,
 customize page size, orientation, font size, line spacing, and margins. Pass
 `--defaults` (or any formatting flag) to skip the prompt in scripted runs.
 
+Text mode also asks for the book's details during setup: title, author,
+optional series, an optional cover image, and a destination folder. The PDF
+then opens with the cover image (if given), a stylized title page, and a
+clickable table of contents listing every chapter (also added as PDF
+bookmarks/outline). The file is named after the title —
+`<dest>/<Title>.pdf` — unless `-o` is given explicitly. The corresponding
+flags (`--title`, `--author`, `--series`, `--cover`, `--dest`) or
+`--defaults` skip these prompts too.
+
 ## Options
 
 | Option                  | Default      | Description                                          |
 |-------------------------|--------------|------------------------------------------------------|
-| `-o, --output`          | `output.pdf` | Output PDF path                                      |
+| `-o, --output`          | title-based  | Output PDF path (default `<dest>/<Title>.pdf`)       |
+| `--title TITLE`         | ask          | Book title (title page + file name)                  |
+| `--author NAME`         | ask          | Author for the title page                            |
+| `--series TEXT`         | ask          | Series line for the title page                       |
+| `--cover IMAGE`         | ask          | Cover image file for the first page                  |
+| `--dest DIR`            | ask          | Destination folder for the PDF                       |
 | `--window TITLE`        | —            | Capture first window whose title contains TITLE      |
 | `--select-region`       | —            | Drag-select the capture area on screen               |
 | `--region X,Y,W,H`      | —            | Explicit capture rectangle                           |

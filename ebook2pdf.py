@@ -907,6 +907,36 @@ def _ask_number(prompt, default):
         print("    Please enter a positive number.")
 
 
+def resolve_book_info(args):
+    """Return {'title','author','series','cover','dest'} for the book.
+    Metadata flags on the command line (or --defaults) skip the prompts."""
+    fields = {k: getattr(args, k)
+              for k in ("title", "author", "series", "cover", "dest")}
+    if args.defaults or any(v is not None for v in fields.values()):
+        return {k: (v or "") for k, v in fields.items()}
+
+    print("\nBook details (used for the title page, contents, and file name):")
+    fields["title"] = input("  Title (Enter to skip): ").strip()
+    fields["author"] = input("  Author (Enter to skip): ").strip()
+    fields["series"] = input("  Series (optional): ").strip()
+    fields["cover"] = input("  Cover image file (optional): ").strip()
+    fields["dest"] = input("  Destination folder (Enter for current): ").strip()
+    return fields
+
+
+def resolve_output_path(args, book):
+    """Output PDF path: -o wins; otherwise <dest>/<sanitized title>.pdf."""
+    if args.output:
+        return args.output
+    title = (book or {}).get("title", "")
+    name = re.sub(r'[<>:"/\\|?*]', "", title).strip().rstrip(".") or "output"
+    name = re.sub(r"\s+", " ", name)
+    dest = os.path.expanduser((book or {}).get("dest", "") or "")
+    if dest:
+        os.makedirs(dest, exist_ok=True)
+    return os.path.join(dest, f"{name}.pdf")
+
+
 def resolve_formatting(args):
     """Return the formatting dict for text mode. Formatting flags on the
     command line (or --defaults) skip the prompt; otherwise offer:
@@ -930,15 +960,49 @@ def resolve_formatting(args):
     return fmt
 
 
-def build_text_pdf(paragraphs, output, fmt=None):
+def _chapter_starts(paragraphs):
+    """Find chapter openings: (index, combined heading text) for every
+    label/h1 paragraph that follows body content (or starts the book),
+    joining the consecutive run of label/h1 lines into one entry."""
+    chapters = []
+    prev = None
+    for i, para in enumerate(paragraphs):
+        if isinstance(para, str):  # "\f" page-break sentinel
+            prev = None
+            continue
+        kind = para["kind"]
+        if kind in ("h1", "label") and prev in (None, "body", "image"):
+            parts = [para["plain"]]
+            j = i + 1
+            while (j < len(paragraphs) and isinstance(paragraphs[j], dict)
+                   and paragraphs[j]["kind"] in ("label", "h1")):
+                parts.append(paragraphs[j]["plain"])
+                j += 1
+            chapters.append((i, " — ".join(parts)))
+        prev = kind
+    return chapters
+
+
+def build_text_pdf(paragraphs, output, fmt=None, book=None):
     """Lay the cleaned paragraphs out on standard pages, styling headings
-    and italics to match the source."""
+    and italics to match the source. With `book` info, prepend a cover
+    page, a stylized title page, and a linked table of contents."""
     from reportlab.lib.enums import TA_CENTER, TA_JUSTIFY, TA_LEFT, TA_RIGHT
     from reportlab.lib.pagesizes import A4, landscape, letter
     from reportlab.lib.styles import ParagraphStyle
     from reportlab.lib.units import cm
-    from reportlab.platypus import (Image as RLImage, PageBreak, Paragraph,
-                                    SimpleDocTemplate, Spacer)
+    from reportlab.platypus import (HRFlowable, Image as RLImage, PageBreak,
+                                    Paragraph, SimpleDocTemplate, Spacer)
+    from reportlab.platypus.tableofcontents import TableOfContents
+
+    class BookDocTemplate(SimpleDocTemplate):
+        def afterFlowable(self, flowable):
+            entry = getattr(flowable, "_toc_entry", None)
+            if entry is not None:
+                text, key = entry
+                self.canv.bookmarkPage(key)
+                self.notify("TOCEntry", (0, _esc(text), self.page, key))
+                self.canv.addOutlineEntry(text, key, level=0)
 
     fmt = {**FORMAT_DEFAULTS, **(fmt or {})}
     page = letter if fmt["page_size"] == "letter" else A4
@@ -970,14 +1034,83 @@ def build_text_pdf(paragraphs, output, fmt=None):
     styles["body-center"] = ParagraphStyle(
         "BodyCenter", parent=styles["body"], alignment=TA_CENTER)
 
-    doc = SimpleDocTemplate(
+    book = book or {}
+    doc = BookDocTemplate(
         output, pagesize=page,
         leftMargin=margin, rightMargin=margin,
         topMargin=margin, bottomMargin=margin,
+        title=book.get("title") or None,
+        author=book.get("author") or None,
     )
+    frame_w = page[0] - 2 * margin
+    frame_h = page[1] - 2 * margin
     story = []
+
+    # --- cover page ---------------------------------------------------------
+    cover = book.get("cover")
+    if cover:
+        cover = os.path.expanduser(cover)
+        if os.path.isfile(cover):
+            pil = Image.open(cover)
+            zoom = min(frame_w / pil.width, frame_h / pil.height)
+            flow = RLImage(cover, width=pil.width * zoom,
+                           height=pil.height * zoom)
+            flow.hAlign = "CENTER"
+            story.append(flow)
+            story.append(PageBreak())
+        else:
+            print(f"Cover image not found, skipping: {cover}")
+
+    # --- title page ----------------------------------------------------------
+    if book.get("title"):
+        rule = dict(width="35%", thickness=0.8, color="black",
+                    spaceBefore=fs, spaceAfter=fs)
+        story.append(Spacer(1, frame_h * 0.22))
+        if book.get("series"):
+            story.append(Paragraph(
+                _esc(book["series"]).upper(),
+                ParagraphStyle("Series", fontName="Times-Roman",
+                               fontSize=fs * 1.05, leading=fs * 1.5,
+                               alignment=TA_CENTER, textColor="#444444")))
+            story.append(Spacer(1, fs * 1.5))
+        story.append(HRFlowable(**rule))
+        story.append(Paragraph(
+            _esc(book["title"]),
+            ParagraphStyle("TitlePage", fontName="Times-Bold",
+                           fontSize=fs * 2.6, leading=fs * 2.6 * 1.15,
+                           alignment=TA_CENTER,
+                           spaceBefore=fs, spaceAfter=fs)))
+        story.append(HRFlowable(**rule))
+        if book.get("author"):
+            story.append(Spacer(1, fs * 2.5))
+            story.append(Paragraph(
+                f"<i>{_esc(book['author'])}</i>",
+                ParagraphStyle("Author", fontName="Times-Roman",
+                               fontSize=fs * 1.4, leading=fs * 1.4 * 1.3,
+                               alignment=TA_CENTER)))
+        story.append(PageBreak())
+
+    # --- table of contents ----------------------------------------------------
+    chapters = _chapter_starts(paragraphs)
+    toc_keys = {i: f"chap{n}" for n, (i, _) in enumerate(chapters)}
+    toc_texts = dict(chapters)
+    if chapters:
+        story.append(Paragraph(
+            "Contents",
+            ParagraphStyle("TOCTitle", fontName="Times-Bold",
+                           fontSize=fs * 1.5, leading=fs * 1.5 * 1.2,
+                           alignment=TA_CENTER, spaceAfter=fs * 1.5)))
+        toc = TableOfContents()
+        toc.dotsMinLevel = 0
+        toc.levelStyles = [ParagraphStyle(
+            "TOCEntry", fontName="Times-Roman", fontSize=fs,
+            leading=fs * 1.9, leftIndent=fs, rightIndent=fs,
+            firstLineIndent=-fs * 0.5)]
+        story.append(toc)
+        story.append(PageBreak())
+
     prev_kind = None
-    for para in paragraphs:
+    for i, para in enumerate(paragraphs):
         if para == "\f":
             story.append(PageBreak())
             prev_kind = None
@@ -1008,9 +1141,16 @@ def build_text_pdf(paragraphs, output, fmt=None):
                 style_key = f"label-{para.get('align', 'left')}"
             elif style_key == "body" and para.get("align") == "center":
                 style_key = "body-center"
-            story.append(Paragraph(para["markup"], styles[style_key]))
+            flow = Paragraph(para["markup"], styles[style_key])
+            if i in toc_keys:
+                flow._toc_entry = (toc_texts[i], toc_keys[i])
+            story.append(flow)
         prev_kind = para["kind"]
-    doc.build(story)
+
+    if chapters:
+        doc.multiBuild(story)  # extra passes settle the TOC page numbers
+    else:
+        doc.build(story)
 
 
 def build_image_pdf(images, output):
@@ -1038,7 +1178,19 @@ def parse_args():
     src.add_argument("--region", metavar="X,Y,W,H",
                      help="capture an explicit region, e.g. 100,80,900,1200")
 
-    p.add_argument("-o", "--output", default="output.pdf", help="output PDF path")
+    p.add_argument("-o", "--output", default=None,
+                   help="output PDF path (default: the book title, or "
+                        "output.pdf, in --dest or the current folder)")
+    p.add_argument("--title", default=None,
+                   help="book title for the title page and the file name")
+    p.add_argument("--author", default=None, help="author for the title page")
+    p.add_argument("--series", default=None,
+                   help="series line for the title page (optional)")
+    p.add_argument("--cover", default=None, metavar="IMAGE",
+                   help="image file (e.g. PNG) used as a full cover page "
+                        "before the title page")
+    p.add_argument("--dest", default=None, metavar="DIR",
+                   help="destination folder for the PDF")
     p.add_argument("--mode", choices=["text", "searchable", "image"],
                    default="text",
                    help="text: OCR text re-flowed onto clean portrait pages "
@@ -1157,8 +1309,11 @@ def main():
     else:
         print(f"Capturing up to {args.pages} pages.")
 
-    # --- formatting (text mode only) ----------------------------------------
+    # --- book details and formatting (text mode only) ------------------------
+    book = resolve_book_info(args) if args.mode == "text" else None
     fmt = resolve_formatting(args) if args.mode == "text" else None
+    args.output = resolve_output_path(args, book)
+    print(f"The PDF will be written to: {os.path.abspath(args.output)}")
 
     # --- capture ------------------------------------------------------------
     images = capture_pages(box, win, args)
@@ -1182,7 +1337,7 @@ def main():
         pages = extract_structured(images, args.lang)
         pages = strip_headers_footers(pages)
         paragraphs = reflow_paragraphs(pages, args.keep_page_breaks)
-        build_text_pdf(paragraphs, args.output, fmt)
+        build_text_pdf(paragraphs, args.output, fmt, book)
         if args.save_text:
             with open(args.save_text, "w", encoding="utf-8") as f:
                 f.write("\n\n".join(p["plain"] for p in paragraphs
