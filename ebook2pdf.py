@@ -644,18 +644,30 @@ def extract_structured(images, lang):
         # The right margin of the text column: justified wrapped lines
         # reach it, so a line ending well short of it is an intentional
         # break (heading lines, place/date blocks, verse) — split there.
+        # Centered lines (poetry, epigraphs) are always their own line,
+        # even on pages with no justified text to establish the margin.
         page_paras = []
         if raw_paras:
             col_right = max(r["right"] for lr in raw_paras for r in lr)
             col_left = min(r["left"] for lr in raw_paras for r in lr)
-            short_cut = col_right - 0.15 * max(col_right - col_left, 1)
+            col_width = max(col_right - col_left, 1)
+            short_cut = col_right - 0.15 * col_width
+
+        def line_is_centered(rec):
+            center = (rec["left"] + rec["right"]) / 2
+            width = rec["right"] - rec["left"]
+            return (abs(center - img.width / 2) < 0.05 * img.width
+                    and width < 0.7 * img.width
+                    and rec["left"] > col_left + 0.08 * col_width)
 
         for line_recs in raw_paras:
             segments, current = [], []
             for i, rec in enumerate(line_recs):
                 current.append(rec)
                 is_last = i == len(line_recs) - 1
-                if not is_last and rec["right"] < short_cut:
+                if not is_last and (rec["right"] < short_cut
+                                    or line_is_centered(rec)
+                                    or line_is_centered(line_recs[i + 1])):
                     segments.append(current)
                     current = []
             if current:
@@ -696,27 +708,48 @@ def extract_structured(images, lang):
         page_center = img.width / 2
         for p in page_paras:
             if p["kind"] == "image":
+                p["_centered"] = False
                 continue
-            plain = p["plain"].strip()
             center = (p["_left"] + p["_right"]) / 2
             width = p["_right"] - p["_left"]
-            centered = (abs(center - page_center) < 0.05 * img.width
-                        and width < 0.7 * img.width)
+            p["_centered"] = (abs(center - page_center) < 0.05 * img.width
+                              and width < 0.7 * img.width)
+
+        def in_centered_run(idx):
+            """True when a neighboring paragraph is normal-sized centered
+            text — i.e. this line sits inside a poem/epigraph block, so a
+            slightly tall measurement must not make it a heading."""
+            for n in (idx - 1, idx + 1):
+                if 0 <= n < len(page_paras):
+                    q = page_paras[n]
+                    if (q["kind"] != "image" and q["_centered"]
+                            and q.get("_ratio", 1.0) < 1.25):
+                        return True
+            return False
+
+        for idx, p in enumerate(page_paras):
+            if p["kind"] == "image":
+                continue
+            plain = p["plain"].strip()
             if CHAPTER_LABEL_RE.match(plain) and len(plain) < 36:
                 p["kind"] = "label"
                 gap_left = p["_left"]
                 gap_right = img.width - p["_right"]
-                if centered:
+                if p["_centered"]:
                     p["align"] = "center"
                 elif gap_right < gap_left * 0.5:
                     p["align"] = "right"
                 else:
                     p["align"] = "left"
-            elif centered and len(plain) < 80:
+            elif p["_centered"] and len(plain) < 80:
                 if p["_ratio"] >= 1.7:
                     p["kind"] = "h1"
-                elif p["_ratio"] >= 1.25:
+                elif p["_ratio"] >= 1.25 and not in_centered_run(idx):
                     p["kind"] = "h2"
+            # centered text that isn't a heading (poems, epigraphs,
+            # dedications) keeps its centering in the output
+            if p["kind"] == "body" and p["_centered"]:
+                p["align"] = "center"
 
         # the heading right after a chapter label is the chapter title —
         # give it full title styling even if it measured on the small side
@@ -749,6 +782,7 @@ def extract_structured(images, lang):
             p.pop("_ratio", None)
             p.pop("_left", None)
             p.pop("_right", None)
+            p.pop("_centered", None)
         pages.append(page_paras)
     return pages
 
@@ -820,6 +854,10 @@ def reflow_paragraphs(pages, keep_page_breaks=False):
                 and prev is not None
                 and prev["kind"] == "body"
                 and p["kind"] == "body"
+                # centered lines (poems, epigraphs) never continue a
+                # justified paragraph from the previous page
+                and prev.get("align") != "center"
+                and p.get("align") != "center"
                 # a short final line means the paragraph ended on that page
                 and not prev.get("ends_short")
                 and (
@@ -929,6 +967,8 @@ def build_text_pdf(paragraphs, output, fmt=None):
             f"Label-{align}", fontName="Times-Bold", fontSize=fs * 1.05,
             leading=fs * 1.05 * 1.2, alignment=ta,
             spaceBefore=fs * 1.2, spaceAfter=fs * 2.2)
+    styles["body-center"] = ParagraphStyle(
+        "BodyCenter", parent=styles["body"], alignment=TA_CENTER)
 
     doc = SimpleDocTemplate(
         output, pagesize=page,
@@ -966,6 +1006,8 @@ def build_text_pdf(paragraphs, output, fmt=None):
             style_key = para["kind"]
             if style_key == "label":
                 style_key = f"label-{para.get('align', 'left')}"
+            elif style_key == "body" and para.get("align") == "center":
+                style_key = "body-center"
             story.append(Paragraph(para["markup"], styles[style_key]))
         prev_kind = para["kind"]
     doc.build(story)
