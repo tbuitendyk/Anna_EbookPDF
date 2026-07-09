@@ -41,11 +41,28 @@ import argparse
 import hashlib
 import io
 import os
+import re
 import sys
-import tempfile
 import time
+from collections import Counter
 
 from PIL import Image
+
+
+def make_dpi_aware():
+    """On Windows, mark the process DPI-aware so window coordinates from
+    pygetwindow match the physical pixels captured by mss. Without this,
+    display scaling (125%, 150%...) makes captures come out cropped."""
+    if sys.platform != "win32":
+        return
+    import ctypes
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)  # per-monitor DPI aware
+    except Exception:
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()
+        except Exception:
+            pass
 
 # Safety cap for end-of-book mode, which normally stops via
 # identical-page detection long before this many captures.
@@ -310,9 +327,99 @@ def extract_text(images, lang):
     return texts
 
 
-def build_text_pdf(texts, output):
-    """Re-flow the OCR text into a clean A4 PDF."""
-    from reportlab.lib.pagesizes import A4
+# Reader chrome that is not part of the book text: page counters,
+# progress percentages, locations ("Página 161 de 413 • 38%", "Loc 1024").
+CHROME_PATTERNS = [
+    re.compile(r"^[\s•·|]*(página|pagina|page|pág\.?|p\.)\s*\d+.*$", re.I),
+    re.compile(r"^[\s•·|]*loc(ation)?\.?\s*\d+.*$", re.I),
+]
+# Bare numbers/percents/separators — only stripped at the BOTTOM of a page,
+# where reader page counters live; at the top they may be chapter numbers.
+BARE_NUMBER_PATTERN = re.compile(r"^[\s•·|.\-–—\d%:]+$")
+
+
+def _norm_line(line):
+    return re.sub(r"\s+", " ", line.strip().lower())
+
+
+def strip_headers_footers(texts):
+    """Remove reader chrome and running headers/footers.
+
+    A line is treated as a running header/footer when its normalized form
+    appears near the top or bottom edge of at least 30% of the pages
+    (e.g. the book title repeated on every page)."""
+    EDGE = 2  # how many lines from each edge of a page to consider
+    edge_counts = Counter()
+    for text in texts:
+        lines = [l for l in text.splitlines() if l.strip()]
+        for line in lines[:EDGE] + lines[-EDGE:]:
+            edge_counts[_norm_line(line)] += 1
+
+    threshold = max(2, int(0.3 * len(texts)))
+    running = {l for l, n in edge_counts.items() if n >= threshold and len(l) > 3}
+
+    cleaned = []
+    for text in texts:
+        lines = text.splitlines()
+        nonempty = [i for i, l in enumerate(lines) if l.strip()]
+        top = set(nonempty[:EDGE])
+        bottom = set(nonempty[-EDGE:])
+        keep = []
+        for i, line in enumerate(lines):
+            if not line.strip():
+                keep.append(line)
+                continue
+            if (i in top or i in bottom) and _norm_line(line) in running:
+                continue
+            if any(p.match(line.strip()) for p in CHROME_PATTERNS):
+                continue
+            if i in bottom and BARE_NUMBER_PATTERN.match(line.strip()):
+                continue
+            keep.append(line)
+        cleaned.append("\n".join(keep).strip())
+    return cleaned
+
+
+_TERMINAL = tuple('.!?:"\'”’)»…')
+
+
+def reflow_paragraphs(texts, keep_page_breaks=False):
+    """Turn per-page OCR text into one continuous list of paragraphs,
+    joining paragraphs that continue across a page break. With
+    keep_page_breaks, a "\\f" sentinel separates pages instead."""
+    paragraphs = []
+    for page_no, text in enumerate(texts):
+        if keep_page_breaks and page_no > 0:
+            paragraphs.append("\f")
+        page_paras = [
+            re.sub(r"\s*\n\s*", " ", p).strip()
+            for p in re.split(r"\n\s*\n", text)
+            if p.strip()
+        ]
+        for i, para in enumerate(page_paras):
+            continues_previous = (
+                not keep_page_breaks
+                and i == 0
+                and paragraphs
+                and (
+                    paragraphs[-1].endswith("-")
+                    or not paragraphs[-1].endswith(_TERMINAL)
+                    or para[0].islower()
+                )
+            )
+            if continues_previous:
+                if paragraphs[-1].endswith("-"):
+                    paragraphs[-1] = paragraphs[-1][:-1] + para
+                else:
+                    paragraphs[-1] += " " + para
+            else:
+                paragraphs.append(para)
+    return paragraphs
+
+
+def build_text_pdf(paragraphs, output, page_size="a4"):
+    """Re-flow the cleaned OCR text into a standard portrait PDF."""
+    from reportlab.lib.pagesizes import A4, letter
     from reportlab.lib.styles import getSampleStyleSheet
     from reportlab.lib.units import cm
     from reportlab.platypus import PageBreak, Paragraph, SimpleDocTemplate, Spacer
@@ -321,22 +428,22 @@ def build_text_pdf(texts, output):
     body = styles["BodyText"]
     body.fontSize = 11
     body.leading = 15
+    body.spaceAfter = 6
 
     doc = SimpleDocTemplate(
-        output, pagesize=A4,
+        output, pagesize=letter if page_size == "letter" else A4,
         leftMargin=2.5 * cm, rightMargin=2.5 * cm,
         topMargin=2.5 * cm, bottomMargin=2.5 * cm,
     )
     story = []
-    for i, text in enumerate(texts):
-        for para in text.split("\n\n"):
-            para = para.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-            para = para.replace("\n", " ").strip()
-            if para:
-                story.append(Paragraph(para, body))
-                story.append(Spacer(1, 6))
-        if i < len(texts) - 1:
+    for para in paragraphs:
+        if para == "\f":
             story.append(PageBreak())
+            continue
+        safe = (para.replace("&", "&amp;")
+                    .replace("<", "&lt;").replace(">", "&gt;"))
+        story.append(Paragraph(safe, body))
+        story.append(Spacer(1, 2))
     doc.build(story)
 
 
@@ -366,10 +473,16 @@ def parse_args():
                      help="capture an explicit region, e.g. 100,80,900,1200")
 
     p.add_argument("-o", "--output", default="output.pdf", help="output PDF path")
-    p.add_argument("--mode", choices=["searchable", "text", "image"],
-                   default="searchable",
-                   help="searchable: images + invisible OCR text layer (default); "
-                        "text: re-flowed OCR text; image: images only")
+    p.add_argument("--mode", choices=["text", "searchable", "image"],
+                   default="text",
+                   help="text: OCR text re-flowed onto clean portrait pages "
+                        "(default); searchable: page images + invisible OCR "
+                        "text layer; image: page images only")
+    p.add_argument("--page-size", choices=["a4", "letter"], default="a4",
+                   help="page size for text mode (default a4)")
+    p.add_argument("--keep-page-breaks", action="store_true",
+                   help="text mode: keep original page boundaries instead of "
+                        "re-flowing paragraphs across them")
     count = p.add_mutually_exclusive_group()
     count.add_argument("--pages", type=int, default=None,
                        help="capture at most N pages (still auto-stops early "
@@ -434,6 +547,7 @@ def configure_tesseract(explicit_cmd=None):
 
 
 def main():
+    make_dpi_aware()
     args = parse_args()
 
     if args.mode in ("searchable", "text"):
@@ -484,10 +598,12 @@ def main():
             print(f"Text written to {args.save_text}")
     elif args.mode == "text":
         texts = extract_text(images, args.lang)
-        build_text_pdf(texts, args.output)
+        texts = strip_headers_footers(texts)
+        paragraphs = reflow_paragraphs(texts, args.keep_page_breaks)
+        build_text_pdf(paragraphs, args.output, args.page_size)
         if args.save_text:
             with open(args.save_text, "w", encoding="utf-8") as f:
-                f.write("\n\n\f\n\n".join(texts))
+                f.write("\n\n".join(p for p in paragraphs if p != "\f"))
             print(f"Text written to {args.save_text}")
     else:
         build_image_pdf(images, args.output)

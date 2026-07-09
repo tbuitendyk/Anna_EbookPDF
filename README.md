@@ -25,6 +25,9 @@ identical captures in a row). All pages are then assembled into a PDF with
 
 Platform notes:
 
+- **Windows**: the tool declares itself DPI-aware so captures are correct
+  with display scaling (125%, 150%, ...). If a capture still looks cropped,
+  use `--select-region` to drag the exact area.
 - **macOS**: grant your terminal *Screen Recording* and *Accessibility*
   permissions (System Settings → Privacy & Security), otherwise captures come
   out black and keystrokes are blocked.
@@ -65,8 +68,8 @@ keystrokes. To abort mid-capture, slam the mouse into any screen corner
 
 | Mode         | Result                                                                 |
 |--------------|------------------------------------------------------------------------|
-| `searchable` | **Default.** Page images with an invisible OCR text layer — looks identical to the source, but text is selectable/searchable. |
-| `text`       | OCR text re-flowed into a clean A4 PDF (smaller file, loses layout).    |
+| `text`       | **Default.** OCR text re-flowed onto clean portrait pages (A4 or letter). Running headers/footers and reader chrome (page counters, progress %) are stripped, and paragraphs that continue across a page turn are joined so the text flows naturally. Use `--keep-page-breaks` to preserve the original page boundaries instead. |
+| `searchable` | Page images with an invisible OCR text layer — looks identical to the source, but text is selectable/searchable. |
 | `image`      | Page images only, no OCR.                                               |
 
 ## Options
@@ -83,6 +86,8 @@ keystrokes. To abort mid-capture, slam the mouse into any screen corner
 | `--delay SEC`           | 1.5          | Wait after each page turn (raise for slow readers)   |
 | `--start-delay SEC`     | 5            | Countdown before capture starts                      |
 | `--stop-after-repeats N`| 2            | Stop after N identical captures in a row             |
+| `--page-size SIZE`      | `a4`         | Text mode page size: `a4` or `letter`                |
+| `--keep-page-breaks`    | off          | Text mode: keep original page boundaries             |
 | `--lang CODE`           | `eng`        | Tesseract language(s), e.g. `eng`, `deu`, `eng+fra`  |
 | `--save-text FILE`      | —            | Also dump the OCR text to a file                     |
 | `--save-images DIR`     | —            | Also save every captured page as PNG                 |
