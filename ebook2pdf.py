@@ -337,113 +337,352 @@ CHROME_PATTERNS = [
 # where reader page counters live; at the top they may be chapter numbers.
 BARE_NUMBER_PATTERN = re.compile(r"^[\s•·|.\-–—\d%:]+$")
 
+# A word image whose glyph slant exceeds this (tangent of the lean angle,
+# ~7 degrees) is treated as italic. Typical italics lean 10-15 degrees.
+ITALIC_SLANT_THRESHOLD = 0.12
+
 
 def _norm_line(line):
     return re.sub(r"\s+", " ", line.strip().lower())
 
 
-def strip_headers_footers(texts):
-    """Remove reader chrome and running headers/footers.
+def _esc(text):
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
-    A line is treated as a running header/footer when its normalized form
-    appears near the top or bottom edge of at least 30% of the pages
-    (e.g. the book title repeated on every page)."""
-    EDGE = 2  # how many lines from each edge of a page to consider
+
+_SLANT_CANDIDATES = [i / 20 for i in range(-6, 7)]  # tangents -0.30..0.30
+
+
+def _word_slant(img):
+    """Estimate the slant (tangent of lean angle) of glyphs in a word image.
+
+    Shears the ink at a range of candidate angles and returns the angle
+    whose vertical projection profile is sharpest — upright text peaks at
+    ~0, italics at ~0.2 (about 12 degrees)."""
+    g = img.convert("L")
+    w, h = g.size
+    if w < 4 or h < 8:
+        return 0.0
+    data = g.tobytes()
+    ink = [(i % w, i // w) for i, v in enumerate(data) if v < 160]
+    if len(ink) < 30:
+        return 0.0
+
+    cy = h / 2
+    best_t, best_energy = 0.0, -1.0
+    for t in _SLANT_CANDIDATES:
+        cols = {}
+        for x, y in ink:
+            # shear right-leaning glyphs back upright around the midline
+            c = int(x + t * (y - cy))
+            cols[c] = cols.get(c, 0) + 1
+        energy = sum(n * n for n in cols.values())
+        if energy > best_energy:
+            best_energy, best_t = energy, t
+    return best_t
+
+
+def _line_markup(words):
+    """words: list of (escaped_text, is_italic) -> line with <i> runs."""
+    segments = []
+    for text, italic in words:
+        if segments and segments[-1][1] == italic:
+            segments[-1][0].append(text)
+        else:
+            segments.append(([text], italic))
+    parts = []
+    for texts, italic in segments:
+        joined = " ".join(texts)
+        parts.append(f"<i>{joined}</i>" if italic else joined)
+    return " ".join(parts)
+
+
+def _join_lines(lines):
+    """Join a paragraph's lines, mending words hyphenated at line ends."""
+    out = ""
+    for line in lines:
+        if not out:
+            out = line
+        elif out.endswith("-</i>"):
+            out = out[:-5] + "</i>" + line
+        elif out.endswith("-"):
+            out = out[:-1] + line
+        else:
+            out += " " + line
+    return out
+
+
+def extract_structured(images, lang):
+    """OCR every page with word geometry and return, per page, a list of
+    paragraph dicts: {"kind": "h1"|"h2"|"body", "plain": ..., "markup": ...}.
+
+    Headings are detected by comparing each paragraph's median word height
+    to the document-wide median (body text). Italics are detected from the
+    glyph slant of each word's image."""
+    import statistics
+
+    import pytesseract
+    from pytesseract import Output
+
+    datas = []
+    for i, img in enumerate(images, 1):
+        print(f"OCR page {i}/{len(images)}...", end="\r", flush=True)
+        datas.append(pytesseract.image_to_data(img, lang=lang,
+                                               output_type=Output.DICT))
+    print()
+
+    def conf(d, j):
+        try:
+            return float(d["conf"][j])
+        except (TypeError, ValueError):
+            return -1.0
+
+    heights = [
+        d["height"][j]
+        for d in datas
+        for j in range(len(d["text"]))
+        if len(d["text"][j].strip()) >= 2 and conf(d, j) > 30
+    ]
+    body_height = statistics.median(heights) if heights else 20
+
+    pages = []
+    for img, d in zip(images, datas):
+        paras = {}  # (block, par) -> {line_num: [word indices]}
+        for j in range(len(d["text"])):
+            if not d["text"][j].strip() or conf(d, j) < 0:
+                continue
+            key = (d["block_num"][j], d["par_num"][j])
+            paras.setdefault(key, {}).setdefault(d["line_num"][j], []).append(j)
+
+        page_paras = []
+        for key, lines in paras.items():
+            plain_lines, markup_lines, word_heights = [], [], []
+            for ln in sorted(lines):
+                texts, flags = [], []
+                for j in lines[ln]:
+                    text = d["text"][j].strip()
+                    box = (d["left"][j], d["top"][j],
+                           d["left"][j] + d["width"][j],
+                           d["top"][j] + d["height"][j])
+                    # short words are too small for slant detection (None);
+                    # they inherit from their neighbors below
+                    italic = (None if len(text) < 3 else
+                              _word_slant(img.crop(box))
+                              > ITALIC_SLANT_THRESHOLD)
+                    texts.append(_esc(text))
+                    flags.append(italic)
+                    if len(text) >= 2:
+                        word_heights.append(d["height"][j])
+                for k, f in enumerate(flags):
+                    if f is None:
+                        prev = next((flags[m] for m in range(k - 1, -1, -1)
+                                     if flags[m] is not None), None)
+                        nxt = next((flags[m] for m in range(k + 1, len(flags))
+                                    if flags[m] is not None), None)
+                        if prev is None:
+                            flags[k] = bool(nxt)
+                        elif nxt is None:
+                            flags[k] = prev
+                        else:
+                            flags[k] = prev and nxt
+                words = list(zip(texts, flags))
+                plain_lines.append(" ".join(texts))
+                markup_lines.append(_line_markup(words))
+            plain = _join_lines(plain_lines)
+            markup = _join_lines(markup_lines)
+            if not plain.strip():
+                continue
+
+            ratio = ((statistics.median(word_heights) / body_height)
+                     if word_heights else 1.0)
+            if ratio >= 1.7 and len(plain) < 80:
+                kind = "h1"
+            elif ratio >= 1.25 and len(plain) < 80:
+                kind = "h2"
+            else:
+                kind = "body"
+            page_paras.append({"kind": kind, "plain": plain, "markup": markup})
+        pages.append(page_paras)
+    return pages
+
+
+def strip_headers_footers(pages):
+    """Remove reader chrome and running headers/footers from structured
+    pages. A paragraph is a running header/footer when its normalized text
+    appears at the edge of at least 30% of the pages."""
+    EDGE = 2  # paragraphs from each edge of a page to consider
     edge_counts = Counter()
-    for text in texts:
-        lines = [l for l in text.splitlines() if l.strip()]
-        for line in lines[:EDGE] + lines[-EDGE:]:
-            edge_counts[_norm_line(line)] += 1
+    for paras in pages:
+        # a set, so a paragraph counts at most once per page even when the
+        # page is short and its top/bottom edge windows overlap
+        for text in {_norm_line(p["plain"]) for p in paras[:EDGE] + paras[-EDGE:]}:
+            edge_counts[text] += 1
 
-    threshold = max(2, int(0.3 * len(texts)))
-    running = {l for l, n in edge_counts.items() if n >= threshold and len(l) > 3}
+    threshold = max(2, int(0.3 * len(pages)))
+    running = {t for t, n in edge_counts.items() if n >= threshold and len(t) > 3}
 
     cleaned = []
-    for text in texts:
-        lines = text.splitlines()
-        nonempty = [i for i, l in enumerate(lines) if l.strip()]
-        top = set(nonempty[:EDGE])
-        bottom = set(nonempty[-EDGE:])
+    for paras in pages:
         keep = []
-        for i, line in enumerate(lines):
-            if not line.strip():
-                keep.append(line)
+        for i, p in enumerate(paras):
+            plain = p["plain"].strip()
+            near_edge = i < EDGE or i >= len(paras) - EDGE
+            near_bottom = i >= len(paras) - EDGE
+            if near_edge and _norm_line(plain) in running:
                 continue
-            if (i in top or i in bottom) and _norm_line(line) in running:
+            if any(pat.match(plain) for pat in CHROME_PATTERNS):
                 continue
-            if any(p.match(line.strip()) for p in CHROME_PATTERNS):
+            if near_bottom and BARE_NUMBER_PATTERN.match(plain):
                 continue
-            if i in bottom and BARE_NUMBER_PATTERN.match(line.strip()):
-                continue
-            keep.append(line)
-        cleaned.append("\n".join(keep).strip())
+            keep.append(p)
+        cleaned.append(keep)
     return cleaned
 
 
 _TERMINAL = tuple('.!?:"\'”’)»…')
 
 
-def reflow_paragraphs(texts, keep_page_breaks=False):
-    """Turn per-page OCR text into one continuous list of paragraphs,
-    joining paragraphs that continue across a page break. With
+def _merge_paragraphs(prev, nxt):
+    """Append paragraph `nxt` to `prev` in place, mending hyphenation."""
+    for field in ("plain", "markup"):
+        a, b = prev[field], nxt[field]
+        if a.endswith("-</i>"):
+            prev[field] = a[:-5] + "</i>" + b
+        elif a.endswith("-"):
+            prev[field] = a[:-1] + b
+        else:
+            prev[field] = a + " " + b
+
+
+def reflow_paragraphs(pages, keep_page_breaks=False):
+    """Flatten structured pages into one list of paragraph dicts, joining
+    body paragraphs that continue across a page break. With
     keep_page_breaks, a "\\f" sentinel separates pages instead."""
-    paragraphs = []
-    for page_no, text in enumerate(texts):
+    out = []
+    for page_no, paras in enumerate(pages):
         if keep_page_breaks and page_no > 0:
-            paragraphs.append("\f")
-        page_paras = [
-            re.sub(r"\s*\n\s*", " ", p).strip()
-            for p in re.split(r"\n\s*\n", text)
-            if p.strip()
-        ]
-        for i, para in enumerate(page_paras):
+            out.append("\f")
+        for i, p in enumerate(paras):
+            prev = out[-1] if out and isinstance(out[-1], dict) else None
             continues_previous = (
                 not keep_page_breaks
                 and i == 0
-                and paragraphs
+                and prev is not None
+                and prev["kind"] == "body"
+                and p["kind"] == "body"
                 and (
-                    paragraphs[-1].endswith("-")
-                    or not paragraphs[-1].endswith(_TERMINAL)
-                    or para[0].islower()
+                    prev["plain"].endswith("-")
+                    or not prev["plain"].endswith(_TERMINAL)
+                    or p["plain"][0].islower()
                 )
             )
             if continues_previous:
-                if paragraphs[-1].endswith("-"):
-                    paragraphs[-1] = paragraphs[-1][:-1] + para
-                else:
-                    paragraphs[-1] += " " + para
+                _merge_paragraphs(prev, p)
             else:
-                paragraphs.append(para)
-    return paragraphs
+                out.append(dict(p))
+    return out
 
 
-def build_text_pdf(paragraphs, output, page_size="a4"):
-    """Re-flow the cleaned OCR text into a standard portrait PDF."""
-    from reportlab.lib.pagesizes import A4, letter
-    from reportlab.lib.styles import getSampleStyleSheet
+FORMAT_DEFAULTS = {
+    "page_size": "a4",
+    "orientation": "portrait",
+    "font_size": 11.0,
+    "line_spacing": 1.4,
+    "margin": 2.5,
+}
+
+
+def _ask_choice(prompt, choices, default):
+    while True:
+        raw = input(f"  {prompt} ({'/'.join(choices)}) [{default}]: ").strip().lower()
+        if not raw:
+            return default
+        if raw in choices:
+            return raw
+        print(f"    Please enter one of: {', '.join(choices)}")
+
+
+def _ask_number(prompt, default):
+    while True:
+        raw = input(f"  {prompt} [{default}]: ").strip()
+        if not raw:
+            return default
+        try:
+            value = float(raw)
+            if value > 0:
+                return value
+        except ValueError:
+            pass
+        print("    Please enter a positive number.")
+
+
+def resolve_formatting(args):
+    """Return the formatting dict for text mode. Formatting flags on the
+    command line (or --defaults) skip the prompt; otherwise offer:
+    Enter = defaults, 1 = customize."""
+    explicit = {k: getattr(args, k) for k in FORMAT_DEFAULTS}
+    if args.defaults or any(v is not None for v in explicit.values()):
+        return {k: v if v is not None else FORMAT_DEFAULTS[k]
+                for k, v in explicit.items()}
+
+    fmt = dict(FORMAT_DEFAULTS)
+    print(f"\nFormatting defaults: {fmt['page_size'].upper()} "
+          f"{fmt['orientation']}, {fmt['font_size']:g} pt font, "
+          f"{fmt['line_spacing']:g} line spacing, {fmt['margin']:g} cm margins")
+    if input("Press Enter to use defaults, or 1 to customize: ").strip() == "1":
+        fmt["page_size"] = _ask_choice("Page size", ["a4", "letter"], "a4")
+        fmt["orientation"] = _ask_choice("Orientation",
+                                         ["portrait", "landscape"], "portrait")
+        fmt["font_size"] = _ask_number("Font size (pt)", 11.0)
+        fmt["line_spacing"] = _ask_number("Line spacing (x font size)", 1.4)
+        fmt["margin"] = _ask_number("Margins (cm)", 2.5)
+    return fmt
+
+
+def build_text_pdf(paragraphs, output, fmt=None):
+    """Lay the cleaned paragraphs out on standard pages, styling headings
+    and italics to match the source."""
+    from reportlab.lib.enums import TA_CENTER, TA_JUSTIFY
+    from reportlab.lib.pagesizes import A4, landscape, letter
+    from reportlab.lib.styles import ParagraphStyle
     from reportlab.lib.units import cm
-    from reportlab.platypus import PageBreak, Paragraph, SimpleDocTemplate, Spacer
+    from reportlab.platypus import PageBreak, Paragraph, SimpleDocTemplate
 
-    styles = getSampleStyleSheet()
-    body = styles["BodyText"]
-    body.fontSize = 11
-    body.leading = 15
-    body.spaceAfter = 6
+    fmt = {**FORMAT_DEFAULTS, **(fmt or {})}
+    page = letter if fmt["page_size"] == "letter" else A4
+    if fmt["orientation"] == "landscape":
+        page = landscape(page)
+    fs = fmt["font_size"]
+    leading = fs * fmt["line_spacing"]
+    margin = fmt["margin"] * cm
+
+    styles = {
+        "body": ParagraphStyle(
+            "Body", fontName="Times-Roman", fontSize=fs, leading=leading,
+            alignment=TA_JUSTIFY, spaceAfter=fs * 0.5),
+        "h1": ParagraphStyle(
+            "H1", fontName="Times-Bold", fontSize=fs * 1.8,
+            leading=fs * 1.8 * 1.2, alignment=TA_CENTER,
+            spaceBefore=fs * 1.6, spaceAfter=fs * 0.9),
+        "h2": ParagraphStyle(
+            "H2", fontName="Times-Bold", fontSize=fs * 1.35,
+            leading=fs * 1.35 * 1.2, alignment=TA_CENTER,
+            spaceBefore=fs * 1.1, spaceAfter=fs * 0.7),
+    }
 
     doc = SimpleDocTemplate(
-        output, pagesize=letter if page_size == "letter" else A4,
-        leftMargin=2.5 * cm, rightMargin=2.5 * cm,
-        topMargin=2.5 * cm, bottomMargin=2.5 * cm,
+        output, pagesize=page,
+        leftMargin=margin, rightMargin=margin,
+        topMargin=margin, bottomMargin=margin,
     )
     story = []
     for para in paragraphs:
         if para == "\f":
             story.append(PageBreak())
             continue
-        safe = (para.replace("&", "&amp;")
-                    .replace("<", "&lt;").replace(">", "&gt;"))
-        story.append(Paragraph(safe, body))
-        story.append(Spacer(1, 2))
+        if isinstance(para, str):
+            para = {"kind": "body", "markup": _esc(para)}
+        story.append(Paragraph(para["markup"], styles[para["kind"]]))
     doc.build(story)
 
 
@@ -478,8 +717,20 @@ def parse_args():
                    help="text: OCR text re-flowed onto clean portrait pages "
                         "(default); searchable: page images + invisible OCR "
                         "text layer; image: page images only")
-    p.add_argument("--page-size", choices=["a4", "letter"], default="a4",
+    p.add_argument("--page-size", choices=["a4", "letter"], default=None,
                    help="page size for text mode (default a4)")
+    p.add_argument("--orientation", choices=["portrait", "landscape"],
+                   default=None,
+                   help="page orientation for text mode (default portrait)")
+    p.add_argument("--font-size", type=float, default=None,
+                   help="body font size in points for text mode (default 11)")
+    p.add_argument("--line-spacing", type=float, default=None,
+                   help="line spacing as a multiple of the font size for "
+                        "text mode (default 1.4)")
+    p.add_argument("--margin", type=float, default=None,
+                   help="page margin in cm for text mode (default 2.5)")
+    p.add_argument("--defaults", action="store_true",
+                   help="use default formatting without prompting")
     p.add_argument("--keep-page-breaks", action="store_true",
                    help="text mode: keep original page boundaries instead of "
                         "re-flowing paragraphs across them")
@@ -578,6 +829,9 @@ def main():
     else:
         print(f"Capturing up to {args.pages} pages.")
 
+    # --- formatting (text mode only) ----------------------------------------
+    fmt = resolve_formatting(args) if args.mode == "text" else None
+
     # --- capture ------------------------------------------------------------
     images = capture_pages(box, win, args)
 
@@ -597,13 +851,14 @@ def main():
                 f.write("\n\n\f\n\n".join(texts))
             print(f"Text written to {args.save_text}")
     elif args.mode == "text":
-        texts = extract_text(images, args.lang)
-        texts = strip_headers_footers(texts)
-        paragraphs = reflow_paragraphs(texts, args.keep_page_breaks)
-        build_text_pdf(paragraphs, args.output, args.page_size)
+        pages = extract_structured(images, args.lang)
+        pages = strip_headers_footers(pages)
+        paragraphs = reflow_paragraphs(pages, args.keep_page_breaks)
+        build_text_pdf(paragraphs, args.output, fmt)
         if args.save_text:
             with open(args.save_text, "w", encoding="utf-8") as f:
-                f.write("\n\n".join(p for p in paragraphs if p != "\f"))
+                f.write("\n\n".join(p["plain"] for p in paragraphs
+                                    if isinstance(p, dict)))
             print(f"Text written to {args.save_text}")
     else:
         build_image_pdf(images, args.output)

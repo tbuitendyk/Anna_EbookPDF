@@ -68,9 +68,14 @@ keystrokes. To abort mid-capture, slam the mouse into any screen corner
 
 | Mode         | Result                                                                 |
 |--------------|------------------------------------------------------------------------|
-| `text`       | **Default.** OCR text re-flowed onto clean portrait pages (A4 or letter). Running headers/footers and reader chrome (page counters, progress %) are stripped, and paragraphs that continue across a page turn are joined so the text flows naturally. Use `--keep-page-breaks` to preserve the original page boundaries instead. |
+| `text`       | **Default.** OCR text re-flowed onto clean standard pages. Running headers/footers and reader chrome (page counters, progress %) are stripped, and paragraphs that continue across a page turn are joined so the text flows naturally. Source formatting is matched where possible: chapter numbers and titles become large centered headings (detected from their relative text size) and italic passages stay italic (detected from glyph slant). Use `--keep-page-breaks` to preserve the original page boundaries instead. |
 | `searchable` | Page images with an invisible OCR text layer — looks identical to the source, but text is selectable/searchable. |
 | `image`      | Page images only, no OCR.                                               |
+
+In text mode you are offered the formatting defaults (A4 portrait, 11 pt font,
+1.4 line spacing, 2.5 cm margins) — press Enter to accept, or enter `1` to
+customize page size, orientation, font size, line spacing, and margins. Pass
+`--defaults` (or any formatting flag) to skip the prompt in scripted runs.
 
 ## Options
 
@@ -86,7 +91,12 @@ keystrokes. To abort mid-capture, slam the mouse into any screen corner
 | `--delay SEC`           | 1.5          | Wait after each page turn (raise for slow readers)   |
 | `--start-delay SEC`     | 5            | Countdown before capture starts                      |
 | `--stop-after-repeats N`| 2            | Stop after N identical captures in a row             |
-| `--page-size SIZE`      | `a4`         | Text mode page size: `a4` or `letter`                |
+| `--page-size SIZE`      | ask/`a4`     | Text mode page size: `a4` or `letter`                |
+| `--orientation O`       | ask/`portrait` | Text mode: `portrait` or `landscape`               |
+| `--font-size PT`        | ask/`11`     | Text mode body font size in points                   |
+| `--line-spacing X`      | ask/`1.4`    | Text mode line spacing (multiple of font size)       |
+| `--margin CM`           | ask/`2.5`    | Text mode page margins in cm                         |
+| `--defaults`            | off          | Use default formatting without prompting             |
 | `--keep-page-breaks`    | off          | Text mode: keep original page boundaries             |
 | `--lang CODE`           | `eng`        | Tesseract language(s), e.g. `eng`, `deu`, `eng+fra`  |
 | `--save-text FILE`      | —            | Also dump the OCR text to a file                     |
