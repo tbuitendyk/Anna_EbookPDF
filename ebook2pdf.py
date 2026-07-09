@@ -344,6 +344,13 @@ CHROME_PATTERNS = [
 # where reader page counters live; at the top they may be chapter numbers.
 BARE_NUMBER_PATTERN = re.compile(r"^[\s•·|.\-–—\d%:]+$")
 
+# Chapter-opening labels ("CHAPTER FOURTEEN", "PROLOGUE") — they force a
+# page break and keep their alignment from the source page.
+CHAPTER_LABEL_RE = re.compile(
+    r"^(chapter|capitulo|capítulo|chapitre|kapitel|part|book)\s+[\w\s-]{1,20}$"
+    r"|^(prologue|epilogue|preface|introduction|interlude|foreword|afterword)$",
+    re.I)
+
 # Shear angles (tangents) treated as italic candidates. Typical italics
 # lean 10-15 degrees (tangent 0.18-0.27).
 ITALIC_SHEARS = [0.15, 0.20, 0.25, 0.30]
@@ -569,12 +576,35 @@ def extract_structured(images, lang):
 
         raw_paras = []
         for key, lines in paras.items():
+            # inline drop cap: OCR sometimes glues the oversized chapter-
+            # opening letter into the first text line as a junk token
+            # ("W.:", "Ww"). A huge 1-3 char first word followed by a
+            # normal-sized word is that letter — reduce it to the letter,
+            # folding it into a short lowercase remainder ("W"+"e" -> "We").
+            first_idxs = lines[min(lines)]
+            if len(first_idxs) >= 2:
+                j0, j1 = first_idxs[0], first_idxs[1]
+                t0 = d["text"][j0].strip()
+                t1 = d["text"][j1].strip()
+                alpha = [c for c in t0 if c.isalpha()]
+                if (len(t0) <= 3 and alpha
+                        and d["height"][j0] >= 1.8 * body_height
+                        and d["height"][j1] < 1.4 * body_height):
+                    letter = alpha[0].upper()
+                    if t1 and t1[0].islower() and len(t1) <= 2:
+                        d["text"][j1] = letter + t1
+                        d["text"][j0] = ""
+                    else:
+                        d["text"][j0] = letter
+
             line_recs = []
             for ln in sorted(lines):
                 texts, flags, heights = [], [], []
                 left = right = top = None
                 for j in lines[ln]:
                     text = d["text"][j].strip()
+                    if not text:
+                        continue
                     box = (d["left"][j], d["top"][j],
                            d["left"][j] + d["width"][j],
                            d["top"][j] + d["height"][j])
@@ -665,19 +695,60 @@ def extract_structured(images, lang):
         # body text, not a heading.
         page_center = img.width / 2
         for p in page_paras:
-            del p["_top"]
             if p["kind"] == "image":
                 continue
+            plain = p["plain"].strip()
             center = (p["_left"] + p["_right"]) / 2
             width = p["_right"] - p["_left"]
             centered = (abs(center - page_center) < 0.05 * img.width
                         and width < 0.7 * img.width)
-            if centered and len(p["plain"]) < 80:
+            if CHAPTER_LABEL_RE.match(plain) and len(plain) < 36:
+                p["kind"] = "label"
+                gap_left = p["_left"]
+                gap_right = img.width - p["_right"]
+                if centered:
+                    p["align"] = "center"
+                elif gap_right < gap_left * 0.5:
+                    p["align"] = "right"
+                else:
+                    p["align"] = "left"
+            elif centered and len(plain) < 80:
                 if p["_ratio"] >= 1.7:
                     p["kind"] = "h1"
                 elif p["_ratio"] >= 1.25:
                     p["kind"] = "h2"
-            del p["_ratio"], p["_left"], p["_right"]
+
+        # the heading right after a chapter label is the chapter title —
+        # give it full title styling even if it measured on the small side
+        for i in range(len(page_paras) - 1):
+            if (page_paras[i]["kind"] == "label"
+                    and page_paras[i + 1]["kind"] == "h2"):
+                page_paras[i + 1]["kind"] = "h1"
+
+        # drop caps: a huge one-to-three-letter "paragraph" is the oversized
+        # first letter of the adjacent paragraph — put it back
+        for i, p in enumerate(page_paras):
+            if (p["kind"] == "body" and p["plain"]
+                    and len(p["plain"]) <= 3 and p["plain"].isalpha()
+                    and p.get("_ratio", 1.0) >= 1.8):
+                letter = p["plain"][0].upper()
+                target = next(
+                    (q for q in page_paras
+                     if q is not p and q["kind"] == "body" and q["plain"]
+                     and q["plain"][0].islower()),
+                    None)
+                if target is not None:
+                    target["plain"] = letter + target["plain"]
+                    target["markup"] = _esc(letter) + target["markup"]
+                    p["plain"] = p["markup"] = ""  # dropped below
+
+        page_paras = [p for p in page_paras
+                      if p["kind"] == "image" or p["plain"]]
+        for p in page_paras:
+            p.pop("_top", None)
+            p.pop("_ratio", None)
+            p.pop("_left", None)
+            p.pop("_right", None)
         pages.append(page_paras)
     return pages
 
@@ -824,7 +895,7 @@ def resolve_formatting(args):
 def build_text_pdf(paragraphs, output, fmt=None):
     """Lay the cleaned paragraphs out on standard pages, styling headings
     and italics to match the source."""
-    from reportlab.lib.enums import TA_CENTER, TA_JUSTIFY
+    from reportlab.lib.enums import TA_CENTER, TA_JUSTIFY, TA_LEFT, TA_RIGHT
     from reportlab.lib.pagesizes import A4, landscape, letter
     from reportlab.lib.styles import ParagraphStyle
     from reportlab.lib.units import cm
@@ -852,6 +923,12 @@ def build_text_pdf(paragraphs, output, fmt=None):
             leading=fs * 1.35 * 1.2, alignment=TA_CENTER,
             spaceBefore=fs * 1.1, spaceAfter=fs * 0.7),
     }
+    label_align = {"left": TA_LEFT, "center": TA_CENTER, "right": TA_RIGHT}
+    for align, ta in label_align.items():
+        styles[f"label-{align}"] = ParagraphStyle(
+            f"Label-{align}", fontName="Times-Bold", fontSize=fs * 1.05,
+            leading=fs * 1.05 * 1.2, alignment=ta,
+            spaceBefore=fs * 1.2, spaceAfter=fs * 2.2)
 
     doc = SimpleDocTemplate(
         output, pagesize=page,
@@ -867,10 +944,10 @@ def build_text_pdf(paragraphs, output, fmt=None):
             continue
         if isinstance(para, str):
             para = {"kind": "body", "markup": _esc(para)}
-        # chapters start on a fresh page: break before an h1 that follows
-        # page content (but not between consecutive heading lines, and not
-        # at the very start of the document)
-        if para["kind"] == "h1" and prev_kind in ("body", "image"):
+        # chapters start on a fresh page: break before a chapter label or
+        # an h1 that follows page content (but not between the label and
+        # its title, and not at the very start of the document)
+        if para["kind"] in ("h1", "label") and prev_kind in ("body", "image"):
             story.append(PageBreak())
         if para["kind"] == "image":
             pil = para["image"]
@@ -886,7 +963,10 @@ def build_text_pdf(paragraphs, output, fmt=None):
             story.append(flow)
             story.append(Spacer(1, fs * 0.6))
         else:
-            story.append(Paragraph(para["markup"], styles[para["kind"]]))
+            style_key = para["kind"]
+            if style_key == "label":
+                style_key = f"label-{para.get('align', 'left')}"
+            story.append(Paragraph(para["markup"], styles[style_key]))
         prev_kind = para["kind"]
     doc.build(story)
 
