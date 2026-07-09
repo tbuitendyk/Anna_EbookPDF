@@ -468,15 +468,23 @@ def _merge_boxes(boxes, gap=16):
 
 def detect_pictures(img, data, scale=8):
     """Find picture regions: cells with non-background content that no OCR
-    word box covers. Returns (left, top, right, bottom) rectangles."""
+    word box covers. Returns (left, top, right, bottom) rectangles.
+
+    Ink is thresholded at full resolution BEFORE downscaling, so thin
+    line art (maps, pen drawings) survives — plain averaging would wash
+    a hairline stroke out of an 8x8 cell."""
     w, h = img.size
     gw, gh = w // scale, h // scale
     if gw < 4 or gh < 4:
         return []
-    small = img.convert("L").resize((gw, gh), Image.BOX)
-    hist = small.histogram()
+    g = img.convert("L")
+    hist = g.histogram()
     bg = max(range(256), key=hist.__getitem__)  # page background shade
-    px = small.tobytes()
+    if bg > 127:
+        bw = g.point(lambda v: 255 if v < bg - 40 else 0)
+    else:
+        bw = g.point(lambda v: 255 if v > bg + 40 else 0)
+    px = bw.resize((gw, gh), Image.BOX).tobytes()  # = ink fraction per cell
 
     text = bytearray(gw * gh)
     for j in range(len(data["text"])):
@@ -494,7 +502,7 @@ def detect_pictures(img, data, scale=8):
 
     content = [
         i for i in range(gw * gh)
-        if not text[i] and abs(px[i] - bg) > 24
+        if not text[i] and px[i] > 8  # >= ~3% of the cell is ink
     ]
     content_set = set(content)
 
@@ -599,8 +607,8 @@ def extract_structured(images, lang):
 
             line_recs = []
             for ln in sorted(lines):
-                texts, flags, heights = [], [], []
-                left = right = top = None
+                texts, flags, heights, confs = [], [], [], []
+                left = right = top = bottom = None
                 for j in lines[ln]:
                     text = d["text"][j].strip()
                     if not text:
@@ -611,6 +619,9 @@ def extract_structured(images, lang):
                     left = box[0] if left is None else min(left, box[0])
                     right = box[2] if right is None else max(right, box[2])
                     top = box[1] if top is None else min(top, box[1])
+                    bottom = box[3] if bottom is None else max(bottom, box[3])
+                    if conf(d, j) >= 0:
+                        confs.append(conf(d, j))
                     # short words and words without vertical stems are
                     # unreliable for slant detection (None); they inherit
                     # from their neighbors below
@@ -636,7 +647,7 @@ def extract_structured(images, lang):
                     "plain": " ".join(texts),
                     "markup": _line_markup(list(zip(texts, flags))),
                     "left": left, "right": right, "top": top,
-                    "heights": heights,
+                    "bottom": bottom, "heights": heights, "confs": confs,
                 })
             if line_recs:
                 raw_paras.append(line_recs)
@@ -678,6 +689,9 @@ def extract_structured(images, lang):
                 markup = _join_lines([r["markup"] for r in seg])
                 if not plain.strip():
                     continue
+                confs = [c for r in seg for c in r["confs"]]
+                if confs and len(plain) > 2 and sum(confs) / len(confs) < 35:
+                    continue  # OCR gibberish (decorative pages, artwork)
                 heights = [h for r in seg for h in r["heights"]]
                 ratio = ((statistics.median(heights) / body_height)
                          if heights else 1.0)
@@ -690,11 +704,25 @@ def extract_structured(images, lang):
                     "_left": min(r["left"] for r in seg),
                     "_right": max(r["right"] for r in seg),
                     "_top": min(r["top"] for r in seg),
+                    "_bottom": max(r["bottom"] for r in seg),
                 })
 
         # pictures: content regions no OCR word covers, slotted into the
-        # page's reading order by their vertical position
-        for pbox in detect_pictures(img, d):
+        # page's reading order by their vertical position. Words that sit
+        # inside a picture (map labels, signs) belong to the picture — the
+        # crop already shows them, so drop their text paragraphs.
+        pic_boxes = detect_pictures(img, d)
+
+        def mostly_inside(p, box):
+            ix = max(0, min(p["_right"], box[2]) - max(p["_left"], box[0]))
+            iy = max(0, min(p["_bottom"], box[3]) - max(p["_top"], box[1]))
+            area = max((p["_right"] - p["_left"])
+                       * (p["_bottom"] - p["_top"]), 1)
+            return ix * iy / area >= 0.6
+
+        page_paras = [p for p in page_paras
+                      if not any(mostly_inside(p, b) for b in pic_boxes)]
+        for pbox in pic_boxes:
             page_paras.append({
                 "kind": "image", "plain": "", "markup": "",
                 "image": img.crop(pbox), "ends_short": True,
@@ -758,6 +786,19 @@ def extract_structured(images, lang):
                     and page_paras[i + 1]["kind"] == "h2"):
                 page_paras[i + 1]["kind"] = "h1"
 
+        # a centered bare number right before a heading is the chapter
+        # number, even when it measured too small for h1 on its own — it
+        # must open the chapter (page break + contents entry), not trail
+        # the previous page
+        for i in range(len(page_paras) - 1):
+            p, q = page_paras[i], page_paras[i + 1]
+            if (p["kind"] in ("body", "h2") and p.get("_centered")
+                    and re.fullmatch(r"\d{1,4}|[IVXLCDM]{1,8}",
+                                     p["plain"].strip(), re.I)
+                    and q["kind"] in ("h1", "h2", "label")):
+                p["kind"] = "h1"
+                p.pop("align", None)
+
         # drop caps: a huge one-to-three-letter "paragraph" is the oversized
         # first letter of the adjacent paragraph — put it back
         for i, p in enumerate(page_paras):
@@ -778,11 +819,9 @@ def extract_structured(images, lang):
         page_paras = [p for p in page_paras
                       if p["kind"] == "image" or p["plain"]]
         for p in page_paras:
-            p.pop("_top", None)
-            p.pop("_ratio", None)
-            p.pop("_left", None)
-            p.pop("_right", None)
-            p.pop("_centered", None)
+            for key in ("_top", "_bottom", "_ratio", "_left", "_right",
+                        "_centered"):
+                p.pop(key, None)
         pages.append(page_paras)
     return pages
 
@@ -907,6 +946,11 @@ def _ask_number(prompt, default):
         print("    Please enter a positive number.")
 
 
+def _clean_path(raw):
+    """Trim whitespace and the quotes Windows' 'Copy as path' adds."""
+    return raw.strip().strip('"').strip("'").strip()
+
+
 def resolve_book_info(args):
     """Return {'title','author','series','cover','dest'} for the book.
     Metadata flags on the command line (or --defaults) skip the prompts."""
@@ -919,8 +963,15 @@ def resolve_book_info(args):
     fields["title"] = input("  Title (Enter to skip): ").strip()
     fields["author"] = input("  Author (Enter to skip): ").strip()
     fields["series"] = input("  Series (optional): ").strip()
-    fields["cover"] = input("  Cover image file (optional): ").strip()
-    fields["dest"] = input("  Destination folder (Enter for current): ").strip()
+    while True:
+        cover = _clean_path(input("  Cover image file (optional): "))
+        if not cover or os.path.isfile(os.path.expanduser(cover)):
+            break
+        print(f"    File not found: {cover} — try again, or press Enter "
+              "to skip.")
+    fields["cover"] = cover
+    fields["dest"] = _clean_path(input("  Destination folder "
+                                       "(Enter for current): "))
     return fields
 
 
@@ -1049,7 +1100,7 @@ def build_text_pdf(paragraphs, output, fmt=None, book=None):
     # --- cover page ---------------------------------------------------------
     cover = book.get("cover")
     if cover:
-        cover = os.path.expanduser(cover)
+        cover = os.path.expanduser(_clean_path(cover))
         if os.path.isfile(cover):
             pil = Image.open(cover)
             zoom = min(frame_w / pil.width, frame_h / pil.height)
