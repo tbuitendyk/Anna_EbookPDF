@@ -40,6 +40,7 @@ Examples:
 import argparse
 import hashlib
 import io
+import json
 import os
 import re
 import sys
@@ -951,27 +952,117 @@ def _clean_path(raw):
     return raw.strip().strip('"').strip("'").strip()
 
 
+# User defaults, kept next to the script: default destination folder, the
+# folder whose newest image becomes the suggested cover, and remembered
+# author/series names offered as numbered choices at the prompts.
+CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "ebook2pdf_config.json")
+
+
+def load_config():
+    try:
+        with open(CONFIG_FILE, encoding="utf-8") as f:
+            cfg = json.load(f)
+    except (OSError, ValueError):
+        cfg = {}
+    cfg.setdefault("dest", "")
+    cfg.setdefault("cover_dir", "")
+    cfg.setdefault("authors", [])
+    cfg.setdefault("series", [])
+    return cfg
+
+
+def save_config(cfg):
+    try:
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2)
+    except OSError as exc:
+        print(f"Could not save {CONFIG_FILE}: {exc}")
+
+
+def newest_image(folder):
+    """Most recently modified image file in `folder`, or ''."""
+    exts = (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif")
+    folder = os.path.expanduser(folder)
+    try:
+        files = [os.path.join(folder, name) for name in os.listdir(folder)
+                 if name.lower().endswith(exts)]
+    except OSError:
+        return ""
+    return max(files, key=os.path.getmtime, default="")
+
+
+def _pick_known(label, plural, known):
+    """Offer remembered names as a numbered list; typing a new name (or a
+    number from the list) selects it, Enter skips."""
+    if known:
+        print(f"  Known {plural}:")
+        for i, name in enumerate(known, 1):
+            print(f"    [{i}] {name}")
+        raw = input(f"  {label} (number, new name, or Enter to skip): ").strip()
+    else:
+        raw = input(f"  {label} (Enter to skip): ").strip()
+    if raw.isdigit() and known and 1 <= int(raw) <= len(known):
+        return known[int(raw) - 1]
+    return raw
+
+
 def resolve_book_info(args):
     """Return {'title','author','series','cover','dest'} for the book.
-    Metadata flags on the command line (or --defaults) skip the prompts."""
+    Metadata flags on the command line (or --defaults) skip the prompts;
+    config defaults (destination folder, newest cover image, remembered
+    authors and series) fill anything not answered."""
+    cfg = load_config()
     fields = {k: getattr(args, k)
               for k in ("title", "author", "series", "cover", "dest")}
     if args.defaults or any(v is not None for v in fields.values()):
-        return {k: (v or "") for k, v in fields.items()}
+        fields = {k: (v or "") for k, v in fields.items()}
+        fields["dest"] = fields["dest"] or cfg["dest"]
+        if not fields["cover"] and cfg["cover_dir"]:
+            fields["cover"] = newest_image(cfg["cover_dir"])
+        return fields
 
     print("\nBook details (used for the title page, contents, and file name):")
     fields["title"] = input("  Title (Enter to skip): ").strip()
-    fields["author"] = input("  Author (Enter to skip): ").strip()
-    fields["series"] = input("  Series (optional): ").strip()
+    fields["author"] = _pick_known("Author", "authors", cfg["authors"])
+    series_name = _pick_known("Series", "series", cfg["series"])
+    fields["series"] = series_name
+    if series_name:
+        number = input("  Book number in the series (Enter to skip): ").strip()
+        if number:
+            fields["series"] = f"{series_name}, Book {number}"
+
+    default_cover = newest_image(cfg["cover_dir"]) if cfg["cover_dir"] else ""
     while True:
-        cover = _clean_path(input("  Cover image file (optional): "))
+        if default_cover:
+            raw = input(f"  Cover image [{default_cover}] "
+                        "(Enter to accept, 'none' to skip): ")
+        else:
+            raw = input("  Cover image file (optional): ")
+        cover = _clean_path(raw) or default_cover
+        if cover.lower() in ("none", "skip"):
+            cover = ""
         if not cover or os.path.isfile(os.path.expanduser(cover)):
             break
-        print(f"    File not found: {cover} — try again, or press Enter "
+        print(f"    File not found: {cover} — try again, or type 'none' "
               "to skip.")
     fields["cover"] = cover
-    fields["dest"] = _clean_path(input("  Destination folder "
-                                       "(Enter for current): "))
+
+    dest_hint = cfg["dest"] or "current folder"
+    fields["dest"] = (_clean_path(input(f"  Destination folder "
+                                        f"[{dest_hint}]: "))
+                      or cfg["dest"])
+
+    # remember new names for next time
+    changed = False
+    if fields["author"] and fields["author"] not in cfg["authors"]:
+        cfg["authors"].append(fields["author"])
+        changed = True
+    if series_name and series_name not in cfg["series"]:
+        cfg["series"].append(series_name)
+        changed = True
+    if changed:
+        save_config(cfg)
     return fields
 
 

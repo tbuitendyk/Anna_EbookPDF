@@ -81,13 +81,35 @@ customize page size, orientation, font size, line spacing, and margins. Pass
 `--defaults` (or any formatting flag) to skip the prompt in scripted runs.
 
 Text mode also asks for the book's details during setup: title, author,
-optional series, an optional cover image, and a destination folder. The PDF
-then opens with the cover image (if given), a stylized title page, and a
-clickable table of contents listing every chapter (also added as PDF
-bookmarks/outline). The file is named after the title —
+optional series (with a book number), an optional cover image, and a
+destination folder. The PDF then opens with the cover image (if given), a
+stylized title page, and a clickable table of contents listing every chapter
+(also added as PDF bookmarks/outline). The file is named after the title —
 `<dest>/<Title>.pdf` — unless `-o` is given explicitly. The corresponding
 flags (`--title`, `--author`, `--series`, `--cover`, `--dest`) or
 `--defaults` skip these prompts too.
+
+## Personal defaults (`ebook2pdf_config.json`)
+
+A config file next to the script stores your defaults:
+
+```json
+{
+  "dest": "C:\\Users\\Bee2026\\Documents\\Ebooks\\Books",
+  "cover_dir": "C:\\Users\\Bee2026\\Documents\\Ebooks\\Covers",
+  "authors": [],
+  "series": []
+}
+```
+
+- `dest` — default destination folder, offered at the prompt (Enter accepts)
+  and used automatically in `--defaults`/flag runs.
+- `cover_dir` — the newest image in this folder is offered as the default
+  cover (Enter accepts, `none` skips, or type another path).
+- `authors` / `series` — remembered names shown as numbered lists at the
+  prompts; pick by number or type a new name. New names are saved back
+  automatically. Picking a series also asks for the book number in the
+  series and builds the title-page line (`My Saga, Book 3`).
 
 ## Options
 
