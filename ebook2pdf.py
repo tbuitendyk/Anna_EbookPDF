@@ -437,6 +437,94 @@ def _join_lines(lines):
     return out
 
 
+def _merge_boxes(boxes, gap=16):
+    """Merge rectangles that overlap or sit within `gap` px of each other."""
+    boxes = list(boxes)
+    merged = True
+    while merged:
+        merged = False
+        out = []
+        while boxes:
+            a = boxes.pop()
+            for i, b in enumerate(out):
+                if (a[0] - gap < b[2] and b[0] - gap < a[2]
+                        and a[1] - gap < b[3] and b[1] - gap < a[3]):
+                    out[i] = (min(a[0], b[0]), min(a[1], b[1]),
+                              max(a[2], b[2]), max(a[3], b[3]))
+                    merged = True
+                    break
+            else:
+                out.append(a)
+        boxes = out
+    return boxes
+
+
+def detect_pictures(img, data, scale=8):
+    """Find picture regions: cells with non-background content that no OCR
+    word box covers. Returns (left, top, right, bottom) rectangles."""
+    w, h = img.size
+    gw, gh = w // scale, h // scale
+    if gw < 4 or gh < 4:
+        return []
+    small = img.convert("L").resize((gw, gh), Image.BOX)
+    hist = small.histogram()
+    bg = max(range(256), key=hist.__getitem__)  # page background shade
+    px = small.tobytes()
+
+    text = bytearray(gw * gh)
+    for j in range(len(data["text"])):
+        if not data["text"][j].strip():
+            continue
+        pad = data["height"][j]  # cover leading/antialiasing around words
+        x0 = max(0, (data["left"][j] - pad) // scale)
+        y0 = max(0, (data["top"][j] - pad) // scale)
+        x1 = min(gw, (data["left"][j] + data["width"][j] + pad) // scale + 1)
+        y1 = min(gh, (data["top"][j] + data["height"][j] + pad) // scale + 1)
+        for y in range(y0, y1):
+            base = y * gw
+            for x in range(x0, x1):
+                text[base + x] = 1
+
+    content = [
+        i for i in range(gw * gh)
+        if not text[i] and abs(px[i] - bg) > 24
+    ]
+    content_set = set(content)
+
+    boxes = []
+    seen = set()
+    for start in content:
+        if start in seen:
+            continue
+        stack = [start]
+        seen.add(start)
+        x0 = x1 = start % gw
+        y0 = y1 = start // gw
+        while stack:
+            c = stack.pop()
+            cx, cy = c % gw, c // gw
+            x0, x1 = min(x0, cx), max(x1, cx)
+            y0, y1 = min(y0, cy), max(y1, cy)
+            for n in (c - 1, c + 1, c - gw, c + gw):
+                if n in content_set and n not in seen and (
+                        abs(n % gw - cx) <= 1):
+                    seen.add(n)
+                    stack.append(n)
+        boxes.append((x0 * scale, y0 * scale,
+                      (x1 + 1) * scale, (y1 + 1) * scale))
+
+    boxes = _merge_boxes(boxes)
+    result = []
+    for x0, y0, x1, y1 in boxes:
+        bw, bh = x1 - x0, y1 - y0
+        if bw < 40 or bh < 40 or bw * bh < 0.005 * w * h:
+            continue  # specks, rules, stray marks
+        pad = scale // 2
+        result.append((max(0, x0 - pad), max(0, y0 - pad),
+                       min(w, x1 + pad), min(h, y1 + pad)))
+    return result
+
+
 def extract_structured(images, lang):
     """OCR every page with word geometry and return, per page, a list of
     paragraph dicts: {"kind": "h1"|"h2"|"body", "plain": ..., "markup": ...}.
@@ -484,7 +572,7 @@ def extract_structured(images, lang):
             line_recs = []
             for ln in sorted(lines):
                 texts, flags, heights = [], [], []
-                left = right = None
+                left = right = top = None
                 for j in lines[ln]:
                     text = d["text"][j].strip()
                     box = (d["left"][j], d["top"][j],
@@ -492,6 +580,7 @@ def extract_structured(images, lang):
                            d["top"][j] + d["height"][j])
                     left = box[0] if left is None else min(left, box[0])
                     right = box[2] if right is None else max(right, box[2])
+                    top = box[1] if top is None else min(top, box[1])
                     # short words and words without vertical stems are
                     # unreliable for slant detection (None); they inherit
                     # from their neighbors below
@@ -516,7 +605,8 @@ def extract_structured(images, lang):
                 line_recs.append({
                     "plain": " ".join(texts),
                     "markup": _line_markup(list(zip(texts, flags))),
-                    "left": left, "right": right, "heights": heights,
+                    "left": left, "right": right, "top": top,
+                    "heights": heights,
                 })
             if line_recs:
                 raw_paras.append(line_recs)
@@ -557,13 +647,27 @@ def extract_structured(images, lang):
                     "_ratio": ratio,
                     "_left": min(r["left"] for r in seg),
                     "_right": max(r["right"] for r in seg),
+                    "_top": min(r["top"] for r in seg),
                 })
+
+        # pictures: content regions no OCR word covers, slotted into the
+        # page's reading order by their vertical position
+        for pbox in detect_pictures(img, d):
+            page_paras.append({
+                "kind": "image", "plain": "", "markup": "",
+                "image": img.crop(pbox), "ends_short": True,
+                "_top": pbox[1],
+            })
+        page_paras.sort(key=lambda p: p["_top"])
 
         # Headings must be larger than body text AND centered on the page —
         # a lone tall-glyphed word at the paragraph indent ("Tidy?") is
         # body text, not a heading.
         page_center = img.width / 2
         for p in page_paras:
+            del p["_top"]
+            if p["kind"] == "image":
+                continue
             center = (p["_left"] + p["_right"]) / 2
             width = p["_right"] - p["_left"]
             centered = (abs(center - page_center) < 0.05 * img.width
@@ -597,6 +701,9 @@ def strip_headers_footers(pages):
     for paras in pages:
         keep = []
         for i, p in enumerate(paras):
+            if p["kind"] == "image":
+                keep.append(p)
+                continue
             plain = p["plain"].strip()
             near_edge = i < EDGE or i >= len(paras) - EDGE
             near_bottom = i >= len(paras) - EDGE
@@ -721,7 +828,8 @@ def build_text_pdf(paragraphs, output, fmt=None):
     from reportlab.lib.pagesizes import A4, landscape, letter
     from reportlab.lib.styles import ParagraphStyle
     from reportlab.lib.units import cm
-    from reportlab.platypus import PageBreak, Paragraph, SimpleDocTemplate
+    from reportlab.platypus import (Image as RLImage, PageBreak, Paragraph,
+                                    SimpleDocTemplate, Spacer)
 
     fmt = {**FORMAT_DEFAULTS, **(fmt or {})}
     page = letter if fmt["page_size"] == "letter" else A4
@@ -760,11 +868,25 @@ def build_text_pdf(paragraphs, output, fmt=None):
         if isinstance(para, str):
             para = {"kind": "body", "markup": _esc(para)}
         # chapters start on a fresh page: break before an h1 that follows
-        # body text (but not between consecutive heading lines, and not
+        # page content (but not between consecutive heading lines, and not
         # at the very start of the document)
-        if para["kind"] == "h1" and prev_kind == "body":
+        if para["kind"] == "h1" and prev_kind in ("body", "image"):
             story.append(PageBreak())
-        story.append(Paragraph(para["markup"], styles[para["kind"]]))
+        if para["kind"] == "image":
+            pil = para["image"]
+            buf = io.BytesIO()
+            pil.save(buf, "PNG")
+            buf.seek(0)
+            frame_w = page[0] - 2 * margin
+            frame_h = page[1] - 2 * margin
+            zoom = min(frame_w / pil.width, frame_h * 0.85 / pil.height, 1.0)
+            flow = RLImage(buf, width=pil.width * zoom,
+                           height=pil.height * zoom)
+            flow.hAlign = "CENTER"
+            story.append(flow)
+            story.append(Spacer(1, fs * 0.6))
+        else:
+            story.append(Paragraph(para["markup"], styles[para["kind"]]))
         prev_kind = para["kind"]
     doc.build(story)
 
@@ -942,7 +1064,7 @@ def main():
         if args.save_text:
             with open(args.save_text, "w", encoding="utf-8") as f:
                 f.write("\n\n".join(p["plain"] for p in paragraphs
-                                    if isinstance(p, dict)))
+                                    if isinstance(p, dict) and p["plain"]))
             print(f"Text written to {args.save_text}")
     else:
         build_image_pdf(images, args.output)
