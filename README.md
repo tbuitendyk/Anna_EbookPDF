@@ -80,6 +80,13 @@ In text mode you are offered the formatting defaults (A4 portrait, 11 pt font,
 customize page size, orientation, font size, line spacing, and margins. Pass
 `--defaults` (or any formatting flag) to skip the prompt in scripted runs.
 
+Text mode can produce a **PDF, an EPUB, or both** — choose at the prompt
+(`Output format: [1] PDF [2] EPUB [3] Both`), with `--format pdf|epub|both`,
+or set `"format"` in the config file. The EPUB carries the same structure as
+the PDF: cover, title page, chapters with headings kept, italics, centered
+poem/epigraph lines, embedded pictures, a navigation table of contents, and
+title/author/series metadata (Calibre-compatible series tags).
+
 Text mode also asks for the book's details during setup: title, author,
 optional series (with a book number), an optional cover image, and a
 destination folder. The PDF then opens with the cover image (if given), a
@@ -121,6 +128,7 @@ A config file next to the script stores your defaults:
 | `--series TEXT`         | ask          | Series line for the title page                       |
 | `--cover IMAGE`         | ask          | Cover image file for the first page                  |
 | `--dest DIR`            | ask          | Destination folder for the PDF                       |
+| `--format F`            | ask          | Text mode output: `pdf`, `epub`, or `both`           |
 | `--window TITLE`        | —            | Capture first window whose title contains TITLE      |
 | `--select-region`       | —            | Drag-select the capture area on screen               |
 | `--region X,Y,W,H`      | —            | Explicit capture rectangle                           |

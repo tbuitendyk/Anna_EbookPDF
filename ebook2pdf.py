@@ -969,6 +969,7 @@ def load_config():
     cfg.setdefault("cover_dir", "")
     cfg.setdefault("authors", [])
     cfg.setdefault("series", [])
+    cfg.setdefault("format", "pdf")
     return cfg
 
 
@@ -1066,17 +1067,41 @@ def resolve_book_info(args):
     return fields
 
 
-def resolve_output_path(args, book):
-    """Output PDF path: -o wins; otherwise <dest>/<sanitized title>.pdf."""
+def resolve_output_path(args, book, ext="pdf"):
+    """Output path: -o wins (its extension swapped to `ext` if needed);
+    otherwise <dest>/<sanitized title>.<ext>."""
     if args.output:
-        return args.output
+        if args.output.lower().endswith(f".{ext}"):
+            return args.output
+        return os.path.splitext(args.output)[0] + f".{ext}"
     title = (book or {}).get("title", "")
     name = re.sub(r'[<>:"/\\|?*]', "", title).strip().rstrip(".") or "output"
     name = re.sub(r"\s+", " ", name)
     dest = os.path.expanduser((book or {}).get("dest", "") or "")
     if dest:
         os.makedirs(dest, exist_ok=True)
-    return os.path.join(dest, f"{name}.pdf")
+    return os.path.join(dest, f"{name}.{ext}")
+
+
+def resolve_format(args):
+    """Which text-mode output to produce: 'pdf', 'epub', or 'both'.
+    The --format flag wins; --defaults uses the config; otherwise ask."""
+    if args.format:
+        return args.format
+    default = load_config().get("format", "pdf")
+    if args.defaults or args.mode != "text":
+        return default if args.mode == "text" else "pdf"
+    choices = {"1": "pdf", "2": "epub", "3": "both",
+               "pdf": "pdf", "epub": "epub", "both": "both"}
+    marker = {"pdf": "1", "epub": "2", "both": "3"}[default]
+    print("\nOutput format: [1] PDF  [2] EPUB  [3] Both")
+    while True:
+        raw = input(f"Choice [{marker}]: ").strip().lower()
+        if not raw:
+            return default
+        if raw in choices:
+            return choices[raw]
+        print("Enter 1, 2, or 3.")
 
 
 def resolve_formatting(args):
@@ -1100,6 +1125,142 @@ def resolve_formatting(args):
         fmt["line_spacing"] = _ask_number("Line spacing (x font size)", 1.4)
         fmt["margin"] = _ask_number("Margins (cm)", 2.5)
     return fmt
+
+
+# Tesseract language -> EPUB/ISO language code (first tag wins for "eng+fra")
+EPUB_LANG = {"eng": "en", "deu": "de", "fra": "fr", "spa": "es", "ita": "it",
+             "por": "pt", "nld": "nl", "pol": "pl", "swe": "sv", "dan": "da",
+             "nor": "no", "fin": "fi", "rus": "ru", "ces": "cs", "cym": "cy"}
+
+EPUB_CSS = """\
+body { font-family: serif; }
+p { text-align: justify; margin: 0 0 0.5em 0; }
+p.center { text-align: center; }
+p.label { font-weight: bold; margin: 2em 0 1em 0; }
+p.label.right { text-align: right; }
+p.label.center { text-align: center; }
+h1 { text-align: center; margin: 1.5em 0 1em 0; }
+h2 { text-align: center; margin: 1em 0 0.8em 0; }
+div.pic { text-align: center; margin: 1em 0; }
+div.pic img { max-width: 100%; }
+div.titlepage { text-align: center; margin-top: 18%; }
+div.titlepage p.series { letter-spacing: 0.12em; color: #444444; }
+div.titlepage h1 { font-size: 2em; margin: 1em 0; }
+div.titlepage p.author { font-style: italic; font-size: 1.2em;
+                         margin-top: 2.5em; text-align: center; }
+"""
+
+
+def build_epub(paragraphs, output, book=None, lang="eng"):
+    """Assemble the structured paragraphs into an EPUB: metadata, cover,
+    title page, one XHTML file per chapter, embedded pictures, and a
+    navigation table of contents."""
+    import uuid
+
+    from ebooklib import epub
+
+    book = book or {}
+    title = book.get("title") or "Untitled"
+    bk = epub.EpubBook()
+    bk.set_identifier(str(uuid.uuid4()))
+    bk.set_title(title)
+    bk.set_language(EPUB_LANG.get(lang.split("+")[0].lower(), "en"))
+    if book.get("author"):
+        bk.add_author(book["author"])
+    series = book.get("series") or ""
+    if series:
+        name = re.sub(r",\s*Book\s+\S+$", "", series)
+        bk.add_metadata(None, "meta", "",
+                        {"name": "calibre:series", "content": name})
+        m = re.search(r"Book\s+(\d+)", series)
+        if m:
+            bk.add_metadata(None, "meta", "",
+                            {"name": "calibre:series_index",
+                             "content": m.group(1)})
+
+    cover = book.get("cover")
+    if cover:
+        cover = os.path.expanduser(_clean_path(cover))
+        if os.path.isfile(cover):
+            ext = os.path.splitext(cover)[1].lower() or ".png"
+            with open(cover, "rb") as f:
+                bk.set_cover(f"cover{ext}", f.read())
+        else:
+            print(f"Cover image not found, skipping: {cover}")
+
+    css = epub.EpubItem(uid="style", file_name="style/main.css",
+                        media_type="text/css", content=EPUB_CSS)
+    bk.add_item(css)
+
+    # split the flow into chapters at the detected chapter openings
+    starts = _chapter_starts(paragraphs)
+    idxs = [i for i, _ in starts]
+    names = [t for _, t in starts]
+    sections = []
+    if not idxs or idxs[0] > 0:
+        head = paragraphs[:idxs[0]] if idxs else paragraphs
+        if any(isinstance(p, dict) for p in head):
+            sections.append(("Front matter", head))
+    for k, i in enumerate(idxs):
+        end = idxs[k + 1] if k + 1 < len(idxs) else len(paragraphs)
+        sections.append((names[k], paragraphs[i:end]))
+
+    chapters = []
+    if book.get("title"):
+        parts = ['<div class="titlepage">']
+        if series:
+            parts.append(f'<p class="series">{_esc(series).upper()}</p>')
+        parts.append(f"<h1>{_esc(title)}</h1>")
+        if book.get("author"):
+            parts.append(f'<p class="author">{_esc(book["author"])}</p>')
+        parts.append("</div>")
+        tp = epub.EpubHtml(uid="titlepage", title="Title Page",
+                           file_name="titlepage.xhtml")
+        tp.content = "".join(parts)
+        tp.add_item(css)
+        bk.add_item(tp)
+        chapters.append(tp)
+
+    pic_n = 0
+    for k, (name, paras) in enumerate(sections, 1):
+        html = []
+        for para in paras:
+            if isinstance(para, str):  # "\f" page-break sentinel
+                continue
+            kind = para["kind"]
+            if kind == "image":
+                pic_n += 1
+                buf = io.BytesIO()
+                para["image"].save(buf, "PNG")
+                fn = f"images/pic{pic_n}.png"
+                bk.add_item(epub.EpubItem(
+                    uid=f"pic{pic_n}", file_name=fn,
+                    media_type="image/png", content=buf.getvalue()))
+                html.append(f'<div class="pic"><img src="{fn}" alt=""/></div>')
+            elif kind == "h1":
+                html.append(f"<h1>{para['markup']}</h1>")
+            elif kind == "h2":
+                html.append(f"<h2>{para['markup']}</h2>")
+            elif kind == "label":
+                align = para.get("align", "left")
+                html.append(f'<p class="label {align}">{para["markup"]}</p>')
+            elif para.get("align") == "center":
+                html.append(f'<p class="center">{para["markup"]}</p>')
+            else:
+                html.append(f"<p>{para['markup']}</p>")
+        ch = epub.EpubHtml(uid=f"chap{k}", title=name,
+                           file_name=f"chap_{k}.xhtml")
+        ch.content = "\n".join(html)
+        ch.add_item(css)
+        bk.add_item(ch)
+        chapters.append(ch)
+
+    bk.toc = chapters
+    bk.add_item(epub.EpubNcx())
+    bk.add_item(epub.EpubNav())
+    bk.spine = (["cover"] if cover and os.path.isfile(cover) else []) \
+        + ["nav"] + chapters
+    epub.write_epub(output, bk, {})
 
 
 def _chapter_starts(paragraphs):
@@ -1333,6 +1494,8 @@ def parse_args():
                         "before the title page")
     p.add_argument("--dest", default=None, metavar="DIR",
                    help="destination folder for the PDF")
+    p.add_argument("--format", choices=["pdf", "epub", "both"], default=None,
+                   help="text mode output: pdf (default), epub, or both")
     p.add_argument("--mode", choices=["text", "searchable", "image"],
                    default="text",
                    help="text: OCR text re-flowed onto clean portrait pages "
@@ -1451,11 +1614,18 @@ def main():
     else:
         print(f"Capturing up to {args.pages} pages.")
 
-    # --- book details and formatting (text mode only) ------------------------
+    # --- book details, output format, formatting (text mode only) ------------
     book = resolve_book_info(args) if args.mode == "text" else None
-    fmt = resolve_formatting(args) if args.mode == "text" else None
+    out_format = resolve_format(args)
+    want_pdf = out_format in ("pdf", "both")
+    want_epub = args.mode == "text" and out_format in ("epub", "both")
+    fmt = (resolve_formatting(args)
+           if args.mode == "text" and want_pdf else None)
     args.output = resolve_output_path(args, book)
-    print(f"The PDF will be written to: {os.path.abspath(args.output)}")
+    epub_output = resolve_output_path(args, book, "epub") if want_epub else None
+    for path, wanted in ((args.output, want_pdf), (epub_output, want_epub)):
+        if wanted and path:
+            print(f"Output: {os.path.abspath(path)}")
 
     # --- capture ------------------------------------------------------------
     images = capture_pages(box, win, args)
@@ -1479,7 +1649,14 @@ def main():
         pages = extract_structured(images, args.lang)
         pages = strip_headers_footers(pages)
         paragraphs = reflow_paragraphs(pages, args.keep_page_breaks)
-        build_text_pdf(paragraphs, args.output, fmt, book)
+        if want_pdf:
+            build_text_pdf(paragraphs, args.output, fmt, book)
+        if want_epub:
+            build_epub(paragraphs, epub_output, book, args.lang)
+            size_kb = os.path.getsize(epub_output) / 1024
+            print(f"Done: {epub_output} ({size_kb:.0f} KB)")
+        if not want_pdf:
+            args.output = None  # skip the PDF size line below
         if args.save_text:
             with open(args.save_text, "w", encoding="utf-8") as f:
                 f.write("\n\n".join(p["plain"] for p in paragraphs
@@ -1488,8 +1665,9 @@ def main():
     else:
         build_image_pdf(images, args.output)
 
-    size_kb = os.path.getsize(args.output) / 1024
-    print(f"Done: {args.output} ({len(images)} pages, {size_kb:.0f} KB)")
+    if args.output:
+        size_kb = os.path.getsize(args.output) / 1024
+        print(f"Done: {args.output} ({len(images)} pages, {size_kb:.0f} KB)")
 
 
 if __name__ == "__main__":
