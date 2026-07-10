@@ -877,7 +877,7 @@ def load_config():
     cfg.setdefault("cover_dir", "")
     cfg.setdefault("authors", [])
     cfg.setdefault("series", [])
-    cfg.setdefault("format", "pdf")
+    cfg.setdefault("format", "both")
     return cfg
 
 
@@ -999,7 +999,7 @@ def resolve_settings(args):
     EPUB margins, OCR confidence, and heading detection. Setting flags on
     the command line (or --defaults) skip the prompt; otherwise a single
     summary is shown — Enter proceeds with defaults, 1 changes settings."""
-    cfg_format = load_config().get("format", "pdf")
+    cfg_format = load_config().get("format", "both")
     flag_values = [args.format, args.page_size, args.orientation,
                    args.font_size, args.line_spacing, args.margin,
                    args.epub_vmargin, args.epub_hmargin,
