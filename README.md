@@ -71,7 +71,7 @@ keystrokes. To abort mid-capture, slam the mouse into any screen corner
 
 | Mode         | Result                                                                 |
 |--------------|------------------------------------------------------------------------|
-| `text`       | **Default.** OCR text re-flowed onto clean standard pages. Running headers/footers and reader chrome (page counters, progress %) are stripped, and paragraphs that continue across a page turn are joined so the text flows naturally. Source formatting is matched where possible: chapter numbers and titles become large centered headings (detected from their relative text size), italic passages stay italic (detected from glyph slant), and intentional line breaks — title/subtitle lines, place-and-date blocks, verse — are kept, since a line that stops well short of the right margin mid-paragraph was broken on purpose. Pictures and illustrations are detected (content regions not covered by any recognized text), cropped from the capture, and placed into the PDF at their position in the text flow, scaled to the page width. Use `--keep-page-breaks` to preserve the original page boundaries instead. |
+| `text`       | **Default.** OCR text re-flowed onto clean standard pages. Running headers/footers and reader chrome (page counters, progress %) are stripped, and paragraphs that continue across a page turn are joined so the text flows naturally. Source formatting is matched where possible: chapter numbers and titles become large centered headings (detected from their relative text size), italic passages stay italic (detected from glyph slant), and intentional line breaks — title/subtitle lines, place-and-date blocks, verse — are kept, since a line that stops well short of the right margin mid-paragraph was broken on purpose. Low-confidence OCR is discarded (words below confidence 20, paragraphs averaging below `--min-confidence`, default 55), which keeps artwork and decorative pages from injecting gibberish. Use `--keep-page-breaks` to preserve the original page boundaries instead. |
 | `searchable` | Page images with an invisible OCR text layer — looks identical to the source, but text is selectable/searchable. |
 | `image`      | Page images only, no OCR.                                               |
 
@@ -84,7 +84,7 @@ Text mode can produce a **PDF, an EPUB, or both** — choose at the prompt
 (`Output format: [1] PDF [2] EPUB [3] Both`), with `--format pdf|epub|both`,
 or set `"format"` in the config file. The EPUB carries the same structure as
 the PDF: cover, title page, chapters with headings kept, italics, centered
-poem/epigraph lines, embedded pictures, a navigation table of contents, and
+poem/epigraph lines, a navigation table of contents, and
 title/author/series metadata (Calibre-compatible series tags).
 
 Text mode also asks for the book's details during setup: title, author,
@@ -114,12 +114,14 @@ Lists the book's chapters and offers, for **EPUB**: remove a chapter's
 heading (its text merges into the previous section — for headings that were
 detected by mistake), delete a section entirely, fix the page margins — the
 margin rules are written into the book's stylesheet, replacing any margins
-this tool set before, so older EPUBs can be repaired in place — or change
-the cover image (replaces the embedded cover; sets one if the book has
-none). For **PDF**: remove pages by number/range (`3,5-7`), remove a whole
-chapter's pages (from its bookmark to the next chapter), or change the
-cover page (replace page 1 with a new cover image, or insert one if the
-book has no cover). Cover prompts default to the newest image in the
+this tool set before, so older EPUBs can be repaired in place — change the
+cover image (replaces the embedded cover; sets one if the book has none),
+or add a chapter heading: pick the paragraph where the chapter starts and
+the section is split there with a new heading and contents entry. For
+**PDF**: remove pages by number/range (`3,5-7`), remove a whole chapter's
+pages (from its bookmark to the next chapter), change the cover page
+(replace page 1 with a new cover image, or insert one if the book has no
+cover), or add a chapter bookmark (title + page number). Cover prompts default to the newest image in the
 configured covers folder. Changes are saved to `<name>-edited.epub/pdf` by
 default; enter a path (including the original) to override.
 

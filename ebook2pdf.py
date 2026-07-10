@@ -455,103 +455,14 @@ def _join_lines(lines):
     return out
 
 
-def _merge_boxes(boxes, gap=16):
-    """Merge rectangles that overlap or sit within `gap` px of each other."""
-    boxes = list(boxes)
-    merged = True
-    while merged:
-        merged = False
-        out = []
-        while boxes:
-            a = boxes.pop()
-            for i, b in enumerate(out):
-                if (a[0] - gap < b[2] and b[0] - gap < a[2]
-                        and a[1] - gap < b[3] and b[1] - gap < a[3]):
-                    out[i] = (min(a[0], b[0]), min(a[1], b[1]),
-                              max(a[2], b[2]), max(a[3], b[3]))
-                    merged = True
-                    break
-            else:
-                out.append(a)
-        boxes = out
-    return boxes
+# OCR confidence gates: individual words below MIN_WORD_CONF are dropped
+# outright; paragraphs whose mean confidence falls below the --min-confidence
+# threshold (default 55) are discarded as gibberish from artwork or
+# decorative pages.
+MIN_WORD_CONF = 20
 
 
-def detect_pictures(img, data, scale=8):
-    """Find picture regions: cells with non-background content that no OCR
-    word box covers. Returns (left, top, right, bottom) rectangles.
-
-    Ink is thresholded at full resolution BEFORE downscaling, so thin
-    line art (maps, pen drawings) survives — plain averaging would wash
-    a hairline stroke out of an 8x8 cell."""
-    w, h = img.size
-    gw, gh = w // scale, h // scale
-    if gw < 4 or gh < 4:
-        return []
-    g = img.convert("L")
-    hist = g.histogram()
-    bg = max(range(256), key=hist.__getitem__)  # page background shade
-    if bg > 127:
-        bw = g.point(lambda v: 255 if v < bg - 40 else 0)
-    else:
-        bw = g.point(lambda v: 255 if v > bg + 40 else 0)
-    px = bw.resize((gw, gh), Image.BOX).tobytes()  # = ink fraction per cell
-
-    text = bytearray(gw * gh)
-    for j in range(len(data["text"])):
-        if not data["text"][j].strip():
-            continue
-        pad = data["height"][j]  # cover leading/antialiasing around words
-        x0 = max(0, (data["left"][j] - pad) // scale)
-        y0 = max(0, (data["top"][j] - pad) // scale)
-        x1 = min(gw, (data["left"][j] + data["width"][j] + pad) // scale + 1)
-        y1 = min(gh, (data["top"][j] + data["height"][j] + pad) // scale + 1)
-        for y in range(y0, y1):
-            base = y * gw
-            for x in range(x0, x1):
-                text[base + x] = 1
-
-    content = [
-        i for i in range(gw * gh)
-        if not text[i] and px[i] > 8  # >= ~3% of the cell is ink
-    ]
-    content_set = set(content)
-
-    boxes = []
-    seen = set()
-    for start in content:
-        if start in seen:
-            continue
-        stack = [start]
-        seen.add(start)
-        x0 = x1 = start % gw
-        y0 = y1 = start // gw
-        while stack:
-            c = stack.pop()
-            cx, cy = c % gw, c // gw
-            x0, x1 = min(x0, cx), max(x1, cx)
-            y0, y1 = min(y0, cy), max(y1, cy)
-            for n in (c - 1, c + 1, c - gw, c + gw):
-                if n in content_set and n not in seen and (
-                        abs(n % gw - cx) <= 1):
-                    seen.add(n)
-                    stack.append(n)
-        boxes.append((x0 * scale, y0 * scale,
-                      (x1 + 1) * scale, (y1 + 1) * scale))
-
-    boxes = _merge_boxes(boxes)
-    result = []
-    for x0, y0, x1, y1 in boxes:
-        bw, bh = x1 - x0, y1 - y0
-        if bw < 40 or bh < 40 or bw * bh < 0.005 * w * h:
-            continue  # specks, rules, stray marks
-        pad = scale // 2
-        result.append((max(0, x0 - pad), max(0, y0 - pad),
-                       min(w, x1 + pad), min(h, y1 + pad)))
-    return result
-
-
-def extract_structured(images, lang):
+def extract_structured(images, lang, min_conf=55):
     """OCR every page with word geometry and return, per page, a list of
     paragraph dicts: {"kind": "h1"|"h2"|"body", "plain": ..., "markup": ...}.
 
@@ -588,7 +499,7 @@ def extract_structured(images, lang):
     for img, d in zip(images, datas):
         paras = {}  # (block, par) -> {line_num: [word indices]}
         for j in range(len(d["text"])):
-            if not d["text"][j].strip() or conf(d, j) < 0:
+            if not d["text"][j].strip() or conf(d, j) < MIN_WORD_CONF:
                 continue
             key = (d["block_num"][j], d["par_num"][j])
             paras.setdefault(key, {}).setdefault(d["line_num"][j], []).append(j)
@@ -701,7 +612,8 @@ def extract_structured(images, lang):
                 if not plain.strip():
                     continue
                 confs = [c for r in seg for c in r["confs"]]
-                if confs and len(plain) > 2 and sum(confs) / len(confs) < 35:
+                if (confs and len(plain) > 2
+                        and sum(confs) / len(confs) < min_conf):
                     continue  # OCR gibberish (decorative pages, artwork)
                 heights = [h for r in seg for h in r["heights"]]
                 ratio = ((statistics.median(heights) / body_height)
@@ -718,27 +630,6 @@ def extract_structured(images, lang):
                     "_bottom": max(r["bottom"] for r in seg),
                 })
 
-        # pictures: content regions no OCR word covers, slotted into the
-        # page's reading order by their vertical position. Words that sit
-        # inside a picture (map labels, signs) belong to the picture — the
-        # crop already shows them, so drop their text paragraphs.
-        pic_boxes = detect_pictures(img, d)
-
-        def mostly_inside(p, box):
-            ix = max(0, min(p["_right"], box[2]) - max(p["_left"], box[0]))
-            iy = max(0, min(p["_bottom"], box[3]) - max(p["_top"], box[1]))
-            area = max((p["_right"] - p["_left"])
-                       * (p["_bottom"] - p["_top"]), 1)
-            return ix * iy / area >= 0.6
-
-        page_paras = [p for p in page_paras
-                      if not any(mostly_inside(p, b) for b in pic_boxes)]
-        for pbox in pic_boxes:
-            page_paras.append({
-                "kind": "image", "plain": "", "markup": "",
-                "image": img.crop(pbox), "ends_short": True,
-                "_top": pbox[1],
-            })
         page_paras.sort(key=lambda p: p["_top"])
 
         # Headings must be larger than body text AND centered on the page —
@@ -746,9 +637,6 @@ def extract_structured(images, lang):
         # body text, not a heading.
         page_center = img.width / 2
         for p in page_paras:
-            if p["kind"] == "image":
-                p["_centered"] = False
-                continue
             center = (p["_left"] + p["_right"]) / 2
             width = p["_right"] - p["_left"]
             p["_centered"] = (abs(center - page_center) < 0.05 * img.width
@@ -761,14 +649,12 @@ def extract_structured(images, lang):
             for n in (idx - 1, idx + 1):
                 if 0 <= n < len(page_paras):
                     q = page_paras[n]
-                    if (q["kind"] != "image" and q["_centered"]
+                    if (q["_centered"]
                             and q.get("_ratio", 1.0) < 1.25):
                         return True
             return False
 
         for idx, p in enumerate(page_paras):
-            if p["kind"] == "image":
-                continue
             plain = p["plain"].strip()
             if CHAPTER_LABEL_RE.match(plain) and len(plain) < 36:
                 p["kind"] = "label"
@@ -790,9 +676,8 @@ def extract_structured(images, lang):
                     # ascenders), inflating the size ratio, so mostly-italic
                     # centered lines (thoughts, epigraphs) stay body, as do
                     # lines sitting inside a centered block (poems).
-                    prev_kind = next(
-                        (page_paras[n]["kind"] for n in range(idx - 1, -1, -1)
-                         if page_paras[n]["kind"] != "image"), None)
+                    prev_kind = (page_paras[idx - 1]["kind"]
+                                 if idx > 0 else None)
                     if prev_kind in ("h1", "label") and len(plain) < 30:
                         p["kind"] = "h2"
                     elif (not in_centered_run(idx)
@@ -840,8 +725,7 @@ def extract_structured(images, lang):
                     target["markup"] = _esc(letter) + target["markup"]
                     p["plain"] = p["markup"] = ""  # dropped below
 
-        page_paras = [p for p in page_paras
-                      if p["kind"] == "image" or p["plain"]]
+        page_paras = [p for p in page_paras if p["plain"]]
         for p in page_paras:
             for key in ("_top", "_bottom", "_ratio", "_left", "_right",
                         "_centered"):
@@ -869,9 +753,6 @@ def strip_headers_footers(pages):
     for paras in pages:
         keep = []
         for i, p in enumerate(paras):
-            if p["kind"] == "image":
-                keep.append(p)
-                continue
             plain = p["plain"].strip()
             near_edge = i < EDGE or i >= len(paras) - EDGE
             near_bottom = i >= len(paras) - EDGE
@@ -1271,9 +1152,7 @@ def build_epub(paragraphs, output, book=None, lang="eng", margins=None):
             if isinstance(para, str):  # "\f" page-break sentinel
                 continue
             kind = para["kind"]
-            if kind == "image":
-                continue  # only the cover image goes into the EPUB
-            elif kind == "h1":
+            if kind == "h1":
                 html.append(f"<h1>{para['markup']}</h1>")
             elif kind == "h2":
                 html.append(f"<h2>{para['markup']}</h2>")
@@ -1318,17 +1197,29 @@ _LEADING_HEADING_RE = re.compile(
 _RUNNING_RE = re.compile(r'<p[^>]*class="running"[^>]*>.*?</p>\s*', re.S)
 
 
-def _strip_leading_headings(html):
-    # unwrap a section <div> so the headings behind it are reachable
+def _unwrap_chapter_div(html):
+    """Peel off a section's <div class="chapter"> wrapper if present."""
     m = re.match(r'\s*<div[^>]*class="chapter"[^>]*>(.*)</div>\s*$',
                  html, re.S)
-    if m:
-        html = m.group(1)
+    return (m.group(1), True) if m else (html, False)
+
+
+def _strip_leading_headings(html):
+    html, _ = _unwrap_chapter_div(html)
     while True:
         m = _LEADING_HEADING_RE.match(html)
         if not m:
             return html
         html = html[m.end():]
+
+
+_BLOCK_SPLIT_RE = re.compile(r"(?<=</p>)\s*|(?<=</h1>)\s*|(?<=</h2>)\s*"
+                             r"|(?<=</h3>)\s*|(?<=</div>)\s*")
+
+
+def _split_blocks(html):
+    """A section's HTML as a list of block elements."""
+    return [part for part in _BLOCK_SPLIT_RE.split(html) if part.strip()]
 
 
 def _first_heading_text(html):
@@ -1349,6 +1240,20 @@ def _flatten_toc_links(entries):
         else:
             links.append(t)
     return links
+
+
+def _insert_toc_after(entries, href, link):
+    """Insert `link` right after the entry pointing at `href` (recursive)."""
+    for i, t in enumerate(entries):
+        head = t[0] if isinstance(t, (list, tuple)) and len(t) == 2 else t
+        if getattr(head, "href", "").split("#")[0] == href:
+            entries.insert(i + 1, link)
+            return True
+        if isinstance(t, (list, tuple)) and len(t) == 2:
+            children = t[1] if isinstance(t[1], list) else list(t[1])
+            if _insert_toc_after(children, href, link):
+                return True
+    return False
 
 
 def _remove_from_toc(entries, href):
@@ -1488,6 +1393,7 @@ def edit_epub(path):
               " the previous section)\n         2 = delete a section entirely"
               "\n         3 = fix page margins"
               "\n         4 = change the cover image"
+              "\n         5 = add a chapter heading (splits a section)"
               "\n         s = save and exit, q = quit without saving")
         choice = input("Choice: ").strip().lower()
         if choice == "q":
@@ -1495,6 +1401,63 @@ def edit_epub(path):
             return
         if choice == "s":
             break
+        if choice == "5":
+            raw = input("Section holding the text where the new chapter "
+                        "starts: ").strip()
+            if not raw.isdigit() or not 1 <= int(raw) <= len(secs):
+                print("Invalid section number.")
+                continue
+            item, _name = secs[int(raw) - 1]
+            inner, wrapped = _unwrap_chapter_div(
+                _body_inner(item.get_content()))
+            blocks = _split_blocks(inner)
+            if len(blocks) < 2:
+                print("That section has too little content to split.")
+                continue
+            print("Paragraphs:")
+            for i, blk in enumerate(blocks, 1):
+                preview = re.sub(r"<[^>]+>", "", blk).strip()[:65]
+                print(f"  [{i:3d}] {preview}")
+            raw = input("Paragraph where the new chapter starts: ").strip()
+            if not raw.isdigit() or not 2 <= int(raw) <= len(blocks):
+                print("Invalid paragraph number (the first paragraph "
+                      "cannot start a new split).")
+                continue
+            heading = input("Heading text: ").strip()
+            if not heading:
+                print("No heading given.")
+                continue
+            cut = int(raw) - 1
+            head_html = "\n".join(blocks[:cut])
+            tail_html = f"<h1>{_esc(heading)}</h1>\n" + "\n".join(blocks[cut:])
+            if wrapped:
+                head_html = f'<div class="chapter">{head_html}</div>'
+                tail_html = f'<div class="chapter">{tail_html}</div>'
+            item.content = head_html
+            new_name = f"added_{len(by_id)}.xhtml"
+            new_item = epub.EpubHtml(uid=f"added{len(by_id)}", title=heading,
+                                     file_name=new_name)
+            new_item.content = tail_html
+            style = next((s for s in bk.get_items()
+                          if s.get_type() == ebooklib.ITEM_STYLE), None)
+            if style is not None:
+                new_item.add_item(style)
+            bk.add_item(new_item)
+            by_id[new_item.id] = new_item
+            pos = spine_ids.index(item.id) + 1
+            spine_ids.insert(pos, new_item.id)
+            bpos = next((i for i, s in enumerate(bk.spine)
+                         if (s[0] if isinstance(s, (list, tuple)) else s)
+                         == item.id), len(bk.spine) - 1) + 1
+            bk.spine.insert(bpos, (new_item.id, "yes"))
+            titles[new_name] = heading
+            link = epub.Link(new_name, heading, f"added{len(by_id)}")
+            bk.toc = list(bk.toc)
+            if not _insert_toc_after(bk.toc, item.file_name, link):
+                bk.toc.append(link)
+            changed = True
+            print(f"Added chapter: {heading}")
+            continue
         if choice == "4":
             path_new = _ask_cover_path()
             if not path_new:
@@ -1632,11 +1595,14 @@ def edit_pdf(path):
 
     removed = set()
     new_cover = None  # (mode, image path); mode: "replace" | "insert"
+    added_marks = []  # (title, zero-based page)
     while True:
         print(f"\n{os.path.basename(path)} — {total} pages"
               + (f", {len(removed)} marked for removal" if removed else "")
               + (f", new cover: {os.path.basename(new_cover[1])}"
-                 if new_cover else ""))
+                 if new_cover else "")
+              + (f", {len(added_marks)} new bookmark(s)"
+                 if added_marks else ""))
         if chapters:
             print("Chapters (from bookmarks):")
             for i, (name, page0) in enumerate(chapters, 1):
@@ -1646,7 +1612,8 @@ def edit_pdf(path):
               "         2 = remove a chapter (its pages, up to the next "
               "chapter)\n"
               "         3 = change the cover page\n"
-              "         u = undo all removals\n"
+              "         4 = add a chapter bookmark (title + page)\n"
+              "         u = undo all changes\n"
               "         s = save and exit, q = quit without saving")
         choice = input("Choice: ").strip().lower()
         if choice == "q":
@@ -1657,6 +1624,16 @@ def edit_pdf(path):
         if choice == "u":
             removed.clear()
             new_cover = None
+            added_marks.clear()
+            continue
+        if choice == "4":
+            title = input("Chapter title: ").strip()
+            raw = input("Page number it starts on: ").strip()
+            if title and raw.isdigit() and 1 <= int(raw) <= total:
+                added_marks.append((title, int(raw) - 1))
+                print(f"Bookmark '{title}' at page {raw}.")
+            else:
+                print("Need a title and a valid page number.")
             continue
         if choice == "3":
             cover_path = _ask_cover_path()
@@ -1687,7 +1664,7 @@ def edit_pdf(path):
             else:
                 print("Invalid chapter number.")
 
-    if not removed and not new_cover:
+    if not removed and not new_cover and not added_marks:
         print("Nothing changed.")
         return
     keep = [i for i in range(total) if i not in removed]
@@ -1706,6 +1683,12 @@ def edit_pdf(path):
     except Exception:
         for i in keep:
             writer.add_page(reader.pages[i])
+    offset = 1 if new_cover else 0
+    for title, page0 in added_marks:
+        if page0 in keep:
+            writer.add_outline_item(title, keep.index(page0) + offset)
+        else:
+            print(f"Skipping bookmark '{title}': its page was removed.")
     out = _ask_save_path(path)
     with open(out, "wb") as f:
         writer.write(f)
@@ -1735,7 +1718,7 @@ def _chapter_starts(paragraphs):
             prev = None
             continue
         kind = para["kind"]
-        if kind in ("h1", "label") and prev in (None, "body", "image"):
+        if kind in ("h1", "label") and prev in (None, "body"):
             parts = [para["plain"]]
             j = i + 1
             while (j < len(paragraphs) and isinstance(paragraphs[j], dict)
@@ -1903,29 +1886,17 @@ def build_text_pdf(paragraphs, output, fmt=None, book=None):
         # chapters start on a fresh page: break before a chapter label or
         # an h1 that follows page content (but not between the label and
         # its title, and not at the very start of the document)
-        if para["kind"] in ("h1", "label") and prev_kind in ("body", "image"):
+        if para["kind"] in ("h1", "label") and prev_kind == "body":
             story.append(PageBreak())
-        if para["kind"] == "image":
-            pil = para["image"]
-            buf = io.BytesIO()
-            pil.save(buf, "PNG")
-            buf.seek(0)
-            zoom = min(frame_w / pil.width, frame_h * 0.85 / pil.height, 1.0)
-            flow = RLImage(buf, width=pil.width * zoom,
-                           height=pil.height * zoom)
-            flow.hAlign = "CENTER"
-            story.append(flow)
-            story.append(Spacer(1, fs * 0.6))
-        else:
-            style_key = para["kind"]
-            if style_key == "label":
-                style_key = f"label-{para.get('align', 'left')}"
-            elif style_key == "body" and para.get("align") == "center":
-                style_key = "body-center"
-            flow = Paragraph(para["markup"], styles[style_key])
-            if i in toc_keys:
-                flow._toc_entry = (toc_texts[i], toc_keys[i])
-            story.append(flow)
+        style_key = para["kind"]
+        if style_key == "label":
+            style_key = f"label-{para.get('align', 'left')}"
+        elif style_key == "body" and para.get("align") == "center":
+            style_key = "body-center"
+        flow = Paragraph(para["markup"], styles[style_key])
+        if i in toc_keys:
+            flow._toc_entry = (toc_texts[i], toc_keys[i])
+        story.append(flow)
         prev_kind = para["kind"]
 
     if chapters:
@@ -2025,6 +1996,9 @@ def parse_args():
                         "ended; the wait grows with each attempt (default 3)")
     p.add_argument("--lang", default="eng",
                    help="Tesseract language code(s), e.g. eng, deu, eng+fra")
+    p.add_argument("--min-confidence", type=float, default=55, metavar="N",
+                   help="drop paragraphs whose mean OCR confidence is below "
+                        "N (default 55; lower keeps more marginal text)")
     p.add_argument("--save-text", metavar="FILE",
                    help="also write the OCR text to FILE (text/searchable modes)")
     p.add_argument("--save-images", metavar="DIR",
@@ -2137,7 +2111,7 @@ def main():
                 f.write("\n\n\f\n\n".join(texts))
             print(f"Text written to {args.save_text}")
     elif args.mode == "text":
-        pages = extract_structured(images, args.lang)
+        pages = extract_structured(images, args.lang, args.min_confidence)
         pages = strip_headers_footers(pages)
         paragraphs = reflow_paragraphs(pages, args.keep_page_breaks)
         if want_pdf:
