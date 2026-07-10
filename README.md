@@ -112,13 +112,16 @@ python ebook2pdf.py --edit "C:\Books\My Great Book.pdf"
 
 Lists the book's chapters and offers, for **EPUB**: remove a chapter's
 heading (its text merges into the previous section — for headings that were
-detected by mistake), delete a section entirely, or fix the page margins —
-the margin rules are written into the book's stylesheet, replacing any
-margins this tool set before, so older EPUBs can be repaired in place. For
-**PDF**: remove pages by number/range (`3,5-7`) or remove a whole chapter's
-pages (from its bookmark to the next chapter). Changes are saved to
-`<name>-edited.epub/pdf` by default; enter a path (including the original)
-to override.
+detected by mistake), delete a section entirely, fix the page margins — the
+margin rules are written into the book's stylesheet, replacing any margins
+this tool set before, so older EPUBs can be repaired in place — or change
+the cover image (replaces the embedded cover; sets one if the book has
+none). For **PDF**: remove pages by number/range (`3,5-7`), remove a whole
+chapter's pages (from its bookmark to the next chapter), or change the
+cover page (replace page 1 with a new cover image, or insert one if the
+book has no cover). Cover prompts default to the newest image in the
+configured covers folder. Changes are saved to `<name>-edited.epub/pdf` by
+default; enter a path (including the original) to override.
 
 ## Personal defaults (`ebook2pdf_config.json`)
 

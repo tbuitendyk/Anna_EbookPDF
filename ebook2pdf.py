@@ -1367,6 +1367,75 @@ def _remove_from_toc(entries, href):
     return out
 
 
+_IMAGE_MEDIA_TYPES = {".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+                      ".png": "image/png", ".webp": "image/webp",
+                      ".gif": "image/gif", ".bmp": "image/bmp"}
+
+
+def _ask_cover_path():
+    """Prompt for a cover image, offering the newest file in the
+    configured covers folder as the default. Returns '' if skipped."""
+    default = newest_image(load_config().get("cover_dir", ""))
+    while True:
+        if default:
+            raw = input(f"New cover image [{default}]: ")
+        else:
+            raw = input("New cover image file: ")
+        path = _clean_path(raw) or default
+        if not path:
+            return ""
+        path = os.path.expanduser(path)
+        if os.path.isfile(path):
+            return path
+        print(f"    File not found: {path} — try again, or press Enter "
+              "to cancel.")
+        default = ""
+
+
+def _find_cover_image(bk):
+    """The book's cover image item, however the EPUB declares it."""
+    import ebooklib
+    for item in bk.get_items():
+        if item.get_type() == ebooklib.ITEM_COVER:
+            return item
+    cover_id = None
+    for ns in ("OPF", None):
+        try:
+            for _val, attrs in bk.get_metadata(ns, "meta") or []:
+                if attrs and attrs.get("name") == "cover":
+                    cover_id = attrs.get("content")
+        except KeyError:
+            pass
+    if cover_id:
+        item = bk.get_item_with_id(cover_id)
+        if item is not None:
+            return item
+    for item in bk.get_items():
+        if (item.get_type() == ebooklib.ITEM_IMAGE
+                and "cover" in item.file_name.lower()):
+            return item
+    return None
+
+
+def _render_cover_page(image_path, width, height):
+    """A single-page in-memory PDF with the image centered and fit."""
+    from reportlab.lib.utils import ImageReader
+    from reportlab.pdfgen import canvas as rl_canvas
+
+    buf = io.BytesIO()
+    c = rl_canvas.Canvas(buf, pagesize=(width, height))
+    img = ImageReader(image_path)
+    iw, ih = img.getSize()
+    margin = 18
+    zoom = min((width - 2 * margin) / iw, (height - 2 * margin) / ih)
+    c.drawImage(img, (width - iw * zoom) / 2, (height - ih * zoom) / 2,
+                iw * zoom, ih * zoom)
+    c.showPage()
+    c.save()
+    buf.seek(0)
+    return buf
+
+
 def _ask_save_path(path):
     stem, ext = os.path.splitext(path)
     default = f"{stem}-edited{ext}"
@@ -1418,6 +1487,7 @@ def edit_epub(path):
         print("Options: 1 = remove a chapter's heading (its text merges into"
               " the previous section)\n         2 = delete a section entirely"
               "\n         3 = fix page margins"
+              "\n         4 = change the cover image"
               "\n         s = save and exit, q = quit without saving")
         choice = input("Choice: ").strip().lower()
         if choice == "q":
@@ -1425,6 +1495,31 @@ def edit_epub(path):
             return
         if choice == "s":
             break
+        if choice == "4":
+            path_new = _ask_cover_path()
+            if not path_new:
+                continue
+            with open(path_new, "rb") as f:
+                data = f.read()
+            ext = os.path.splitext(path_new)[1].lower()
+            media = _IMAGE_MEDIA_TYPES.get(ext, "image/png")
+            existing = _find_cover_image(bk)
+            if existing is not None:
+                existing.content = data
+                existing.media_type = media
+            else:
+                # register the image plus the standard cover metadata that
+                # readers use for the library thumbnail (set_cover's page
+                # object does not survive a read/write round trip)
+                item = epub.EpubItem(uid="cover-img",
+                                     file_name=f"images/cover{ext or '.png'}",
+                                     media_type=media, content=data)
+                bk.add_item(item)
+                bk.add_metadata(None, "meta", "",
+                                {"name": "cover", "content": "cover-img"})
+            changed = True
+            print(f"Cover set from {os.path.basename(path_new)}.")
+            continue
         if choice == "3":
             v = _ask_number("Top/bottom margin (em)",
                             EPUB_MARGIN_DEFAULTS["vmargin"])
@@ -1536,9 +1631,12 @@ def edit_pdf(path):
     chapters.sort(key=lambda c: c[1])
 
     removed = set()
+    new_cover = None  # (mode, image path); mode: "replace" | "insert"
     while True:
         print(f"\n{os.path.basename(path)} — {total} pages"
-              + (f", {len(removed)} marked for removal" if removed else ""))
+              + (f", {len(removed)} marked for removal" if removed else "")
+              + (f", new cover: {os.path.basename(new_cover[1])}"
+                 if new_cover else ""))
         if chapters:
             print("Chapters (from bookmarks):")
             for i, (name, page0) in enumerate(chapters, 1):
@@ -1547,6 +1645,7 @@ def edit_pdf(path):
         print("Options: 1 = remove pages (e.g. 3,5-7)\n"
               "         2 = remove a chapter (its pages, up to the next "
               "chapter)\n"
+              "         3 = change the cover page\n"
               "         u = undo all removals\n"
               "         s = save and exit, q = quit without saving")
         choice = input("Choice: ").strip().lower()
@@ -1557,6 +1656,16 @@ def edit_pdf(path):
             break
         if choice == "u":
             removed.clear()
+            new_cover = None
+            continue
+        if choice == "3":
+            cover_path = _ask_cover_path()
+            if not cover_path:
+                continue
+            mode = input("[r]eplace the current first page, or [i]nsert a "
+                         "new page before it? [r]: ").strip().lower()
+            new_cover = ("insert" if mode.startswith("i") else "replace",
+                         cover_path)
             continue
         if choice == "1":
             raw = input("Pages to remove: ").strip()
@@ -1578,13 +1687,20 @@ def edit_pdf(path):
             else:
                 print("Invalid chapter number.")
 
-    if not removed:
+    if not removed and not new_cover:
         print("Nothing changed.")
         return
     keep = [i for i in range(total) if i not in removed]
-    if not keep:
+    if new_cover and new_cover[0] == "replace" and keep and keep[0] == 0:
+        keep = keep[1:]
+    if not keep and not new_cover:
         sys.exit("Refusing to remove every page.")
     writer = PdfWriter()
+    if new_cover:
+        box = reader.pages[0].mediabox
+        cover_buf = _render_cover_page(new_cover[1],
+                                       float(box.width), float(box.height))
+        writer.append(PdfReader(cover_buf))
     try:
         writer.append(reader, pages=keep)
     except Exception:
@@ -1593,7 +1709,7 @@ def edit_pdf(path):
     out = _ask_save_path(path)
     with open(out, "wb") as f:
         writer.write(f)
-    print(f"Saved: {out} ({len(keep)} pages)")
+    print(f"Saved: {out} ({len(writer.pages)} pages)")
 
 
 def edit_book(path):
