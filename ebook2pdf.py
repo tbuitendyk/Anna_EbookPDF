@@ -583,6 +583,8 @@ def extract_structured(images, lang, min_conf=55, h1_ratio=1.8,
                     "markup": _line_markup(list(zip(texts, flags))),
                     "left": left, "right": right, "top": top,
                     "bottom": bottom, "heights": heights, "confs": confs,
+                    "maxh": max((d["height"][j] for j in lines[ln]
+                                 if d["text"][j].strip()), default=0),
                 })
             if line_recs:
                 raw_paras.append(line_recs)
@@ -641,6 +643,7 @@ def extract_structured(images, lang, min_conf=55, h1_ratio=1.8,
                     "_right": max(r["right"] for r in seg),
                     "_top": min(r["top"] for r in seg),
                     "_bottom": max(r["bottom"] for r in seg),
+                    "_maxh": max(r["maxh"] for r in seg),
                 })
 
         page_paras.sort(key=lambda p: p["_top"])
@@ -679,6 +682,11 @@ def extract_structured(images, lang, min_conf=55, h1_ratio=1.8,
                     p["align"] = "right"
                 else:
                     p["align"] = "left"
+            elif (p["_centered"] and len(plain) < 60
+                    and re.match(r"^\d{1,4}\s*[-–—:.]\s+\S", plain)):
+                # "10 - Going to Town": number-separator-title chapter
+                # lines are chapter openings at any print size
+                p["kind"] = "h1"
             elif (p["_centered"] and plain.isupper() and len(plain) < 40
                     and sum(ch.isalpha() for ch in plain) >= 3
                     and not plain.endswith(_TERMINAL)
@@ -745,26 +753,31 @@ def extract_structured(images, lang, min_conf=55, h1_ratio=1.8,
                     q.pop("align", None)
 
         # drop caps: a huge one-to-three-letter "paragraph" is the oversized
-        # first letter of the adjacent paragraph — put it back
+        # first letter of the adjacent paragraph — put it back. When the
+        # adjacent paragraph was OCR'd with its word already complete, the
+        # lone letter is an orphan artifact and is removed.
         for i, p in enumerate(page_paras):
             if (p["kind"] == "body" and p["plain"]
                     and len(p["plain"]) <= 3 and p["plain"].isalpha()
-                    and p.get("_ratio", 1.0) >= 1.8):
+                    and p.get("_maxh", 0) >= 1.8 * body_height):
                 letter = p["plain"][0].upper()
+                candidates = list(page_paras[i + 1:])
+                if i > 0:
+                    candidates.append(page_paras[i - 1])
                 target = next(
-                    (q for q in page_paras
-                     if q is not p and q["kind"] == "body" and q["plain"]
+                    (q for q in candidates
+                     if q["kind"] == "body" and q["plain"]
                      and q["plain"][0].islower()),
                     None)
                 if target is not None:
                     target["plain"] = letter + target["plain"]
                     target["markup"] = _esc(letter) + target["markup"]
-                    p["plain"] = p["markup"] = ""  # dropped below
+                p["plain"] = p["markup"] = ""  # dropped below
 
         page_paras = [p for p in page_paras if p["plain"]]
         for p in page_paras:
             for key in ("_top", "_bottom", "_ratio", "_left", "_right",
-                        "_centered"):
+                        "_centered", "_maxh"):
                 p.pop(key, None)
         pages.append(page_paras)
     return pages
