@@ -503,7 +503,13 @@ def extract_structured(images, lang, min_conf=55, h1_ratio=1.8,
     for img, d in zip(images, datas):
         paras = {}  # (block, par) -> {line_num: [word indices]}
         for j in range(len(d["text"])):
-            if not d["text"][j].strip() or conf(d, j) < MIN_WORD_CONF:
+            text_j = d["text"][j].strip()
+            if not text_j:
+                continue
+            # decorative drop caps often OCR at rock-bottom confidence;
+            # keep single letters so the drop-cap repair can use them
+            if conf(d, j) < MIN_WORD_CONF and not (
+                    len(text_j) == 1 and text_j.isalpha()):
                 continue
             key = (d["block_num"][j], d["par_num"][j])
             paras.setdefault(key, {}).setdefault(d["line_num"][j], []).append(j)
@@ -525,7 +531,10 @@ def extract_structured(images, lang, min_conf=55, h1_ratio=1.8,
                         and d["height"][j0] >= 1.8 * body_height
                         and d["height"][j1] < 1.4 * body_height):
                     letter = alpha[0].upper()
-                    if t1 and t1[0].islower() and len(t1) <= 2:
+                    # the token after a drop cap is the rest of its word
+                    # ("M" + "aleen" -> "Maleen") whenever it starts
+                    # lowercase
+                    if t1 and t1[0].islower():
                         d["text"][j1] = letter + t1
                         d["text"][j0] = ""
                     else:
@@ -670,6 +679,14 @@ def extract_structured(images, lang, min_conf=55, h1_ratio=1.8,
                     p["align"] = "right"
                 else:
                     p["align"] = "left"
+            elif (p["_centered"] and plain.isupper() and len(plain) < 40
+                    and sum(ch.isalpha() for ch in plain) >= 3
+                    and not plain.endswith(_TERMINAL)
+                    and not in_centered_run(idx)):
+                # a short centered ALL-CAPS line is a chapter title even
+                # when it prints at body size ("THE CHOICE") — some books
+                # set their titles in small caps with no size difference
+                p["kind"] = "h1"
             elif p["_centered"] and len(plain) < 80:
                 if p["_ratio"] >= h1_ratio:
                     p["kind"] = "h1"
@@ -699,18 +716,33 @@ def extract_structured(images, lang, min_conf=55, h1_ratio=1.8,
                     and page_paras[i + 1]["kind"] == "h2"):
                 page_paras[i + 1]["kind"] = "h1"
 
-        # a centered bare number right before a heading is the chapter
-        # number, even when it measured too small for h1 on its own — it
-        # must open the chapter (page break + contents entry), not trail
-        # the previous page
+        # a centered bare number right before a heading — or before a
+        # centered title-like line (short, ALL CAPS or Title Case, no
+        # sentence punctuation) — is a chapter opening, even when both
+        # print at body size ("1" over "THE CHOICE"). The number and the
+        # title both become chapter headings so the page break and the
+        # contents entry land before them.
+        def _title_like(q):
+            plain = q["plain"].strip()
+            letters = sum(c.isalpha() for c in plain)
+            return (q["kind"] == "body" and q.get("_centered")
+                    and len(plain) < 40 and letters >= 3
+                    and not plain.endswith(_TERMINAL)
+                    and (plain.isupper() or plain.istitle()))
+
         for i in range(len(page_paras) - 1):
             p, q = page_paras[i], page_paras[i + 1]
             if (p["kind"] in ("body", "h2") and p.get("_centered")
                     and re.fullmatch(r"\d{1,4}|[IVXLCDM]{1,8}",
-                                     p["plain"].strip(), re.I)
-                    and q["kind"] in ("h1", "h2", "label")):
-                p["kind"] = "h1"
-                p.pop("align", None)
+                                     p["plain"].strip(), re.I)):
+                if q["kind"] in ("h1", "h2", "label"):
+                    p["kind"] = "h1"
+                    p.pop("align", None)
+                elif _title_like(q):
+                    p["kind"] = "h1"
+                    q["kind"] = "h1"
+                    p.pop("align", None)
+                    q.pop("align", None)
 
         # drop caps: a huge one-to-three-letter "paragraph" is the oversized
         # first letter of the adjacent paragraph — put it back
