@@ -96,6 +96,24 @@ stylized title page, and a clickable table of contents listing every chapter
 flags (`--title`, `--author`, `--series`, `--cover`, `--dest`) or
 `--defaults` skip these prompts too.
 
+Every EPUB section opens with the book title as a small all-caps running
+header (readers paginate reflowable text themselves, so a per-screen header
+isn't possible — it appears at each chapter start).
+
+## Editing an existing book
+
+```bash
+python ebook2pdf.py --edit "C:\Books\My Great Book.epub"
+python ebook2pdf.py --edit "C:\Books\My Great Book.pdf"
+```
+
+Lists the book's chapters and offers, for **EPUB**: remove a chapter's
+heading (its text merges into the previous section — for headings that were
+detected by mistake) or delete a section entirely. For **PDF**: remove pages
+by number/range (`3,5-7`) or remove a whole chapter's pages (from its
+bookmark to the next chapter). Changes are saved to `<name>-edited.epub/pdf`
+by default; enter a path (including the original) to override.
+
 ## Personal defaults (`ebook2pdf_config.json`)
 
 A config file next to the script stores your defaults:

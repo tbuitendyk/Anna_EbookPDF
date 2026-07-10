@@ -1166,6 +1166,8 @@ h1 { text-align: center; margin: 1.5em 0 1em 0; }
 h2 { text-align: center; margin: 1em 0 0.8em 0; }
 div.pic { text-align: center; margin: 1em 0; }
 div.pic img { max-width: 100%; }
+p.running { font-size: 0.7em; letter-spacing: 0.1em; text-align: center;
+            color: #666666; margin: 0 0 2.5em 0; }
 div.titlepage { text-align: center; margin-top: 18%; }
 div.titlepage p.series { letter-spacing: 0.12em; color: #444444; }
 div.titlepage h1 { font-size: 2em; margin: 1em 0; }
@@ -1246,6 +1248,11 @@ def build_epub(paragraphs, output, book=None, lang="eng"):
 
     for k, (name, paras) in enumerate(sections, 1):
         html = []
+        if book.get("title"):
+            # running book-title header at the top of every section
+            # (readers paginate reflowable text, so per-screen headers
+            # aren't possible — this shows at each section start)
+            html.append(f'<p class="running">{_esc(title).upper()}</p>')
         for para in paras:
             if isinstance(para, str):  # "\f" page-break sentinel
                 continue
@@ -1276,6 +1283,280 @@ def build_epub(paragraphs, output, book=None, lang="eng"):
     bk.spine = (["cover"] if cover and os.path.isfile(cover) else []) \
         + ["nav"] + chapters
     epub.write_epub(output, bk, {})
+
+
+# ---------------------------------------------------------------------------
+# Editing existing books
+# ---------------------------------------------------------------------------
+
+
+def _body_inner(content):
+    """Inner HTML of an XHTML document's <body> (or the whole fragment)."""
+    s = content.decode("utf-8") if isinstance(content, bytes) else content
+    m = re.search(r"<body[^>]*>(.*)</body>", s, re.S | re.I)
+    return m.group(1) if m else s
+
+
+_LEADING_HEADING_RE = re.compile(
+    r'^\s*(<h[12][^>]*>.*?</h[12]>|<p[^>]*class="[^"]*label[^"]*"[^>]*>.*?</p>'
+    r'|<p[^>]*class="running"[^>]*>.*?</p>)\s*', re.S)
+_RUNNING_RE = re.compile(r'<p[^>]*class="running"[^>]*>.*?</p>\s*', re.S)
+
+
+def _strip_leading_headings(html):
+    while True:
+        m = _LEADING_HEADING_RE.match(html)
+        if not m:
+            return html
+        html = html[m.end():]
+
+
+def _first_heading_text(html):
+    m = re.search(r"<h[12][^>]*>(.*?)</h[12]>", html, re.S)
+    if m:
+        return re.sub(r"<[^>]+>", "", m.group(1)).strip()
+    return ""
+
+
+def _flatten_toc_links(entries):
+    links = []
+    for t in entries or []:
+        if isinstance(t, (list, tuple)):
+            head, children = (t[0], t[1]) if len(t) == 2 else (None, t)
+            if head is not None and getattr(head, "href", ""):
+                links.append(head)
+            links.extend(_flatten_toc_links(children))
+        else:
+            links.append(t)
+    return links
+
+
+def _remove_from_toc(entries, href):
+    out = []
+    for t in entries or []:
+        if isinstance(t, (list, tuple)) and len(t) == 2:
+            head, children = t
+            children = _remove_from_toc(children, href)
+            if getattr(head, "href", "").split("#")[0] == href and not children:
+                continue
+            out.append((head, children))
+        elif getattr(t, "href", "").split("#")[0] == href:
+            continue
+        else:
+            out.append(t)
+    return out
+
+
+def _ask_save_path(path):
+    stem, ext = os.path.splitext(path)
+    default = f"{stem}-edited{ext}"
+    raw = _clean_path(input(f"Save as [{default}]: "))
+    return raw or default
+
+
+def edit_epub(path):
+    import ebooklib
+    from ebooklib import epub
+
+    bk = epub.read_epub(path)
+    spine_ids = [s[0] if isinstance(s, (list, tuple)) else s for s in bk.spine]
+    by_id = {item.id: item for item in bk.get_items()}
+    titles = {}
+    for link in _flatten_toc_links(bk.toc):
+        titles.setdefault(getattr(link, "href", "").split("#")[0],
+                          getattr(link, "title", ""))
+
+    def sections():
+        out = []
+        for sid in spine_ids:
+            item = by_id.get(sid)
+            if item is None or item.get_type() != ebooklib.ITEM_DOCUMENT:
+                continue
+            if os.path.basename(item.file_name) in ("nav.xhtml", "toc.xhtml",
+                                                    "cover.xhtml"):
+                continue
+            name = (titles.get(item.file_name)
+                    or _first_heading_text(_body_inner(item.get_content()))
+                    or item.file_name)
+            out.append((item, name))
+        return out
+
+    def drop(item):
+        nonlocal spine_ids
+        bk.items.remove(item)
+        spine_ids = [sid for sid in spine_ids if sid != item.id]
+        bk.spine = [s for s in bk.spine
+                    if (s[0] if isinstance(s, (list, tuple)) else s) != item.id]
+        bk.toc = _remove_from_toc(bk.toc, item.file_name)
+
+    changed = False
+    while True:
+        secs = sections()
+        print(f"\n{os.path.basename(path)} — {len(secs)} sections:")
+        for i, (_, name) in enumerate(secs, 1):
+            print(f"  [{i:2d}] {name[:70]}")
+        print("Options: 1 = remove a chapter's heading (its text merges into"
+              " the previous section)\n         2 = delete a section entirely"
+              "\n         s = save and exit, q = quit without saving")
+        choice = input("Choice: ").strip().lower()
+        if choice == "q":
+            print("No changes saved.")
+            return
+        if choice == "s":
+            break
+        if choice not in ("1", "2"):
+            continue
+        raw = input("Section number: ").strip()
+        if not raw.isdigit() or not 1 <= int(raw) <= len(secs):
+            print("Invalid section number.")
+            continue
+        idx = int(raw) - 1
+        item, name = secs[idx]
+        if choice == "2":
+            drop(item)
+            changed = True
+            print(f"Deleted: {name}")
+            continue
+        # remove heading: strip it and fold the text into the previous section
+        rest = _strip_leading_headings(_body_inner(item.get_content()))
+        rest = _RUNNING_RE.sub("", rest)
+        if idx > 0:
+            prev = secs[idx - 1][0]
+            prev.content = _body_inner(prev.get_content()) + rest
+            drop(item)
+        else:
+            item.content = rest
+            bk.toc = _remove_from_toc(bk.toc, item.file_name)
+        changed = True
+        print(f"Removed heading: {name}")
+
+    if not changed:
+        print("Nothing changed.")
+        return
+    # links read from an existing EPUB carry no uid, which breaks
+    # ebooklib's NCX writer — assign them before saving
+    for i, link in enumerate(_flatten_toc_links(bk.toc)):
+        if not getattr(link, "uid", None):
+            try:
+                link.uid = f"navpoint{i}"
+            except AttributeError:
+                pass
+    out = _ask_save_path(path)
+    epub.write_epub(out, bk, {})
+    print(f"Saved: {out}")
+
+
+def _parse_page_ranges(raw, total):
+    """'3,5-7' -> zero-based page indices; 1-based input, inclusive ends."""
+    pages = set()
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            a, _, b = part.partition("-")
+            if a.strip().isdigit() and b.strip().isdigit():
+                pages.update(range(int(a) - 1, int(b)))
+        elif part.isdigit():
+            pages.add(int(part) - 1)
+    return {p for p in pages if 0 <= p < total}
+
+
+def edit_pdf(path):
+    from pypdf import PdfReader, PdfWriter
+
+    reader = PdfReader(path)
+    total = len(reader.pages)
+    chapters = []  # (title, zero-based start page)
+
+    def walk(entries):
+        for entry in entries:
+            if isinstance(entry, list):
+                walk(entry)
+            else:
+                try:
+                    chapters.append(
+                        (entry.title,
+                         reader.get_destination_page_number(entry)))
+                except Exception:
+                    pass
+    try:
+        walk(reader.outline)
+    except Exception:
+        pass
+    chapters.sort(key=lambda c: c[1])
+
+    removed = set()
+    while True:
+        print(f"\n{os.path.basename(path)} — {total} pages"
+              + (f", {len(removed)} marked for removal" if removed else ""))
+        if chapters:
+            print("Chapters (from bookmarks):")
+            for i, (name, page0) in enumerate(chapters, 1):
+                mark = " [removed]" if page0 in removed else ""
+                print(f"  [{i:2d}] p.{page0 + 1:<4d} {name[:60]}{mark}")
+        print("Options: 1 = remove pages (e.g. 3,5-7)\n"
+              "         2 = remove a chapter (its pages, up to the next "
+              "chapter)\n"
+              "         u = undo all removals\n"
+              "         s = save and exit, q = quit without saving")
+        choice = input("Choice: ").strip().lower()
+        if choice == "q":
+            print("No changes saved.")
+            return
+        if choice == "s":
+            break
+        if choice == "u":
+            removed.clear()
+            continue
+        if choice == "1":
+            raw = input("Pages to remove: ").strip()
+            picked = _parse_page_ranges(raw, total)
+            if picked:
+                removed |= picked
+                print(f"Marked {len(picked)} page(s).")
+            else:
+                print("No valid pages in that input.")
+        elif choice == "2" and chapters:
+            raw = input("Chapter number: ").strip()
+            if raw.isdigit() and 1 <= int(raw) <= len(chapters):
+                k = int(raw) - 1
+                start = chapters[k][1]
+                end = (chapters[k + 1][1] if k + 1 < len(chapters) else total)
+                removed |= set(range(start, end))
+                print(f"Marked pages {start + 1}-{end} "
+                      f"({chapters[k][0][:40]}).")
+            else:
+                print("Invalid chapter number.")
+
+    if not removed:
+        print("Nothing changed.")
+        return
+    keep = [i for i in range(total) if i not in removed]
+    if not keep:
+        sys.exit("Refusing to remove every page.")
+    writer = PdfWriter()
+    try:
+        writer.append(reader, pages=keep)
+    except Exception:
+        for i in keep:
+            writer.add_page(reader.pages[i])
+    out = _ask_save_path(path)
+    with open(out, "wb") as f:
+        writer.write(f)
+    print(f"Saved: {out} ({len(keep)} pages)")
+
+
+def edit_book(path):
+    path = os.path.expanduser(_clean_path(path))
+    if not os.path.isfile(path):
+        sys.exit(f"File not found: {path}")
+    if path.lower().endswith(".epub"):
+        edit_epub(path)
+    elif path.lower().endswith(".pdf"):
+        edit_pdf(path)
+    else:
+        sys.exit("Only .epub and .pdf files can be edited.")
 
 
 def _chapter_starts(paragraphs):
@@ -1509,6 +1790,10 @@ def parse_args():
                         "before the title page")
     p.add_argument("--dest", default=None, metavar="DIR",
                    help="destination folder for the PDF")
+    p.add_argument("--edit", metavar="BOOK",
+                   help="edit an existing .epub or .pdf instead of scanning: "
+                        "list chapters, remove chapter headings (EPUB), "
+                        "delete sections/pages")
     p.add_argument("--format", choices=["pdf", "epub", "both"], default=None,
                    help="text mode output: pdf (default), epub, or both")
     p.add_argument("--mode", choices=["text", "searchable", "image"],
@@ -1600,6 +1885,10 @@ def configure_tesseract(explicit_cmd=None):
 def main():
     make_dpi_aware()
     args = parse_args()
+
+    if args.edit:
+        edit_book(args.edit)
+        return
 
     if args.mode in ("searchable", "text"):
         configure_tesseract(args.tesseract_cmd)
