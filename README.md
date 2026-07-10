@@ -96,9 +96,10 @@ stylized title page, and a clickable table of contents listing every chapter
 flags (`--title`, `--author`, `--series`, `--cover`, `--dest`) or
 `--defaults` skip these prompts too.
 
-Every EPUB section opens with the book title as a small all-caps running
-header (readers paginate reflowable text themselves, so a per-screen header
-isn't possible — it appears at each chapter start).
+The EPUB stylesheet declares page margins several ways (`@page` margins,
+`body` padding, and a top offset on each chapter) so the text doesn't sit
+flush against the top of the screen — readers differ in which declaration
+they honor, so all are included.
 
 ## Editing an existing book
 

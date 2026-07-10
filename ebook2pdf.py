@@ -1156,7 +1156,12 @@ EPUB_LANG = {"eng": "en", "deu": "de", "fra": "fr", "spa": "es", "ita": "it",
              "nor": "no", "fin": "fi", "rus": "ru", "ces": "cs", "cym": "cy"}
 
 EPUB_CSS = """\
-body { font-family: serif; }
+/* Breathing room at the page edges. Readers vary in what they honor:
+   @page margins (ADE, Kobo), body padding (many), or neither (older
+   Kindle) — declaring all is harmless where ignored. */
+@page { margin: 1.4em 0.6em; }
+body { font-family: serif; margin: 0; padding: 1.4em 0.4em; }
+div.chapter { margin-top: 2.2em; }
 p { text-align: justify; margin: 0 0 0.5em 0; }
 p.center { text-align: center; }
 p.label { font-weight: bold; margin: 2em 0 1em 0; }
@@ -1166,8 +1171,6 @@ h1 { text-align: center; margin: 1.5em 0 1em 0; }
 h2 { text-align: center; margin: 1em 0 0.8em 0; }
 div.pic { text-align: center; margin: 1em 0; }
 div.pic img { max-width: 100%; }
-p.running { font-size: 0.7em; letter-spacing: 0.1em; text-align: center;
-            color: #666666; margin: 0 0 2.5em 0; }
 div.titlepage { text-align: center; margin-top: 18%; }
 div.titlepage p.series { letter-spacing: 0.12em; color: #444444; }
 div.titlepage h1 { font-size: 2em; margin: 1em 0; }
@@ -1247,12 +1250,7 @@ def build_epub(paragraphs, output, book=None, lang="eng"):
         chapters.append(tp)
 
     for k, (name, paras) in enumerate(sections, 1):
-        html = []
-        if book.get("title"):
-            # running book-title header at the top of every section
-            # (readers paginate reflowable text, so per-screen headers
-            # aren't possible — this shows at each section start)
-            html.append(f'<p class="running">{_esc(title).upper()}</p>')
+        html = ['<div class="chapter">']
         for para in paras:
             if isinstance(para, str):  # "\f" page-break sentinel
                 continue
@@ -1270,6 +1268,7 @@ def build_epub(paragraphs, output, book=None, lang="eng"):
                 html.append(f'<p class="center">{para["markup"]}</p>')
             else:
                 html.append(f"<p>{para['markup']}</p>")
+        html.append("</div>")
         ch = epub.EpubHtml(uid=f"chap{k}", title=name,
                            file_name=f"chap_{k}.xhtml")
         ch.content = "\n".join(html)
@@ -1304,6 +1303,11 @@ _RUNNING_RE = re.compile(r'<p[^>]*class="running"[^>]*>.*?</p>\s*', re.S)
 
 
 def _strip_leading_headings(html):
+    # unwrap a section <div> so the headings behind it are reachable
+    m = re.match(r'\s*<div[^>]*class="chapter"[^>]*>(.*)</div>\s*$',
+                 html, re.S)
+    if m:
+        html = m.group(1)
     while True:
         m = _LEADING_HEADING_RE.match(html)
         if not m:
