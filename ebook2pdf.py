@@ -462,7 +462,11 @@ def _join_lines(lines):
 MIN_WORD_CONF = 20
 
 
-def extract_structured(images, lang, min_conf=55):
+HEADING_DEFAULTS = {"h1_ratio": 1.8, "h2_ratio": 1.35}
+
+
+def extract_structured(images, lang, min_conf=55, h1_ratio=1.8,
+                       h2_ratio=1.35):
     """OCR every page with word geometry and return, per page, a list of
     paragraph dicts: {"kind": "h1"|"h2"|"body", "plain": ..., "markup": ...}.
 
@@ -650,7 +654,7 @@ def extract_structured(images, lang, min_conf=55):
                 if 0 <= n < len(page_paras):
                     q = page_paras[n]
                     if (q["_centered"]
-                            and q.get("_ratio", 1.0) < 1.25):
+                            and q.get("_ratio", 1.0) < h2_ratio):
                         return True
             return False
 
@@ -667,9 +671,9 @@ def extract_structured(images, lang, min_conf=55):
                 else:
                     p["align"] = "left"
             elif p["_centered"] and len(plain) < 80:
-                if p["_ratio"] >= 1.7:
+                if p["_ratio"] >= h1_ratio:
                     p["kind"] = "h1"
-                elif p["_ratio"] >= 1.25:
+                elif p["_ratio"] >= h2_ratio:
                     # A short line directly under a chapter title/label is a
                     # subtitle — heading-group position outranks the checks
                     # below. Otherwise: italic glyph boxes run tall (slant +
@@ -923,8 +927,6 @@ def resolve_book_info(args):
     if args.defaults or any(v is not None for v in fields.values()):
         fields = {k: (v or "") for k, v in fields.items()}
         fields["dest"] = fields["dest"] or cfg["dest"]
-        if not fields["cover"] and cfg["cover_dir"]:
-            fields["cover"] = newest_image(cfg["cover_dir"])
         return fields
 
     print("\nBook details (used for the title page, contents, and file name):")
@@ -937,20 +939,25 @@ def resolve_book_info(args):
         if number:
             fields["series"] = f"{series_name}, Book {number}"
 
-    default_cover = newest_image(cfg["cover_dir"]) if cfg["cover_dir"] else ""
+    newest = newest_image(cfg["cover_dir"]) if cfg["cover_dir"] else ""
     while True:
-        if default_cover:
-            raw = input(f"  Cover image [{default_cover}] "
-                        "(Enter to accept, 'none' to skip): ")
+        if newest:
+            raw = input(f"  Cover image (Enter = none, 1 = newest: "
+                        f"{os.path.basename(newest)}, or a path): ")
         else:
-            raw = input("  Cover image file (optional): ")
-        cover = _clean_path(raw) or default_cover
-        if cover.lower() in ("none", "skip"):
+            raw = input("  Cover image (Enter = none, or a path): ")
+        raw = raw.strip()
+        if not raw:
             cover = ""
-        if not cover or os.path.isfile(os.path.expanduser(cover)):
             break
-        print(f"    File not found: {cover} — try again, or type 'none' "
-              "to skip.")
+        if raw == "1" and newest:
+            cover = newest
+            break
+        cover = _clean_path(raw)
+        if os.path.isfile(os.path.expanduser(cover)):
+            break
+        print(f"    File not found: {cover} — try again, or press Enter "
+              "for no cover.")
     fields["cover"] = cover
 
     dest_hint = cfg["dest"] or "current folder"
@@ -987,48 +994,78 @@ def resolve_output_path(args, book, ext="pdf"):
     return os.path.join(dest, f"{name}.{ext}")
 
 
-def resolve_format(args):
-    """Which text-mode output to produce: 'pdf', 'epub', or 'both'.
-    The --format flag wins; --defaults uses the config; otherwise ask."""
-    if args.format:
-        return args.format
-    default = load_config().get("format", "pdf")
-    if args.defaults or args.mode != "text":
-        return default if args.mode == "text" else "pdf"
-    choices = {"1": "pdf", "2": "epub", "3": "both",
-               "pdf": "pdf", "epub": "epub", "both": "both"}
-    marker = {"pdf": "1", "epub": "2", "both": "3"}[default]
-    print("\nOutput format: [1] PDF  [2] EPUB  [3] Both")
-    while True:
-        raw = input(f"Choice [{marker}]: ").strip().lower()
-        if not raw:
-            return default
-        if raw in choices:
-            return choices[raw]
-        print("Enter 1, 2, or 3.")
+def resolve_settings(args):
+    """All conversion settings in one place: output format, PDF layout,
+    EPUB margins, OCR confidence, and heading detection. Setting flags on
+    the command line (or --defaults) skip the prompt; otherwise a single
+    summary is shown — Enter proceeds with defaults, 1 changes settings."""
+    cfg_format = load_config().get("format", "pdf")
+    flag_values = [args.format, args.page_size, args.orientation,
+                   args.font_size, args.line_spacing, args.margin,
+                   args.epub_vmargin, args.epub_hmargin,
+                   args.min_confidence, args.h1_ratio, args.h2_ratio]
 
+    def from_flags():
+        return {
+            "format": args.format or cfg_format,
+            "pdf": {k: getattr(args, k) if getattr(args, k) is not None
+                    else FORMAT_DEFAULTS[k] for k in FORMAT_DEFAULTS},
+            "epub": {
+                "vmargin": (args.epub_vmargin
+                            if args.epub_vmargin is not None
+                            else EPUB_MARGIN_DEFAULTS["vmargin"]),
+                "hmargin": (args.epub_hmargin
+                            if args.epub_hmargin is not None
+                            else EPUB_MARGIN_DEFAULTS["hmargin"]),
+            },
+            "min_conf": (args.min_confidence
+                         if args.min_confidence is not None else 55),
+            "h1_ratio": (args.h1_ratio if args.h1_ratio is not None
+                         else HEADING_DEFAULTS["h1_ratio"]),
+            "h2_ratio": (args.h2_ratio if args.h2_ratio is not None
+                         else HEADING_DEFAULTS["h2_ratio"]),
+        }
 
-def resolve_formatting(args):
-    """Return the formatting dict for text mode. Formatting flags on the
-    command line (or --defaults) skip the prompt; otherwise offer:
-    Enter = defaults, 1 = customize."""
-    explicit = {k: getattr(args, k) for k in FORMAT_DEFAULTS}
-    if args.defaults or any(v is not None for v in explicit.values()):
-        return {k: v if v is not None else FORMAT_DEFAULTS[k]
-                for k, v in explicit.items()}
+    if args.defaults or any(v is not None for v in flag_values):
+        return from_flags()
 
-    fmt = dict(FORMAT_DEFAULTS)
-    print(f"\nFormatting defaults: {fmt['page_size'].upper()} "
-          f"{fmt['orientation']}, {fmt['font_size']:g} pt font, "
-          f"{fmt['line_spacing']:g} line spacing, {fmt['margin']:g} cm margins")
-    if input("Press Enter to use defaults, or 1 to customize: ").strip() == "1":
+    s = from_flags()  # all defaults at this point
+    fmt = s["pdf"]
+    print(f"""
+Settings:
+  Output format : {s['format'].upper()}
+  PDF layout    : {fmt['page_size'].upper()} {fmt['orientation']}, \
+{fmt['font_size']:g} pt, {fmt['line_spacing']:g} line spacing, \
+{fmt['margin']:g} cm margins
+  EPUB margins  : {s['epub']['vmargin']:g} em top/bottom, \
+{s['epub']['hmargin']:g} em sides
+  OCR filter    : keep paragraphs with mean confidence >= {s['min_conf']:g}
+  Headings      : chapter title >= {s['h1_ratio']:g}x body text, \
+subheading >= {s['h2_ratio']:g}x""")
+    if input("Press Enter to proceed with defaults, "
+             "or 1 to change settings: ").strip() != "1":
+        return s
+
+    s["format"] = _ask_choice("Output format", ["pdf", "epub", "both"],
+                              cfg_format)
+    if s["format"] in ("pdf", "both"):
         fmt["page_size"] = _ask_choice("Page size", ["a4", "letter"], "a4")
         fmt["orientation"] = _ask_choice("Orientation",
                                          ["portrait", "landscape"], "portrait")
         fmt["font_size"] = _ask_number("Font size (pt)", 11.0)
         fmt["line_spacing"] = _ask_number("Line spacing (x font size)", 1.4)
         fmt["margin"] = _ask_number("Margins (cm)", 2.5)
-    return fmt
+    if s["format"] in ("epub", "both"):
+        s["epub"]["vmargin"] = _ask_number(
+            "EPUB top/bottom margin (em)", EPUB_MARGIN_DEFAULTS["vmargin"])
+        s["epub"]["hmargin"] = _ask_number(
+            "EPUB side margin (em)", EPUB_MARGIN_DEFAULTS["hmargin"])
+    s["min_conf"] = _ask_number("Minimum OCR confidence (0-100)", 55)
+    s["h1_ratio"] = _ask_number("Chapter title size (x body text)",
+                                HEADING_DEFAULTS["h1_ratio"])
+    s["h2_ratio"] = _ask_number("Subheading size (x body text)",
+                                HEADING_DEFAULTS["h2_ratio"])
+    return s
 
 
 # Tesseract language -> EPUB/ISO language code (first tag wins for "eng+fra")
@@ -1730,23 +1767,6 @@ def _chapter_starts(paragraphs):
     return chapters
 
 
-def resolve_epub_margins(args):
-    """EPUB page-edge margins (em). Flags or --defaults skip the prompt."""
-    explicit = {"vmargin": args.epub_vmargin, "hmargin": args.epub_hmargin}
-    if args.defaults or any(v is not None for v in explicit.values()):
-        return {k: v if v is not None else EPUB_MARGIN_DEFAULTS[k]
-                for k, v in explicit.items()}
-    m = dict(EPUB_MARGIN_DEFAULTS)
-    print(f"\nEPUB margins: {m['vmargin']:g} em top/bottom, "
-          f"{m['hmargin']:g} em sides")
-    if input("Press Enter to use these, or 1 to customize: ").strip() == "1":
-        m["vmargin"] = _ask_number("Top/bottom margin (em)",
-                                   EPUB_MARGIN_DEFAULTS["vmargin"])
-        m["hmargin"] = _ask_number("Side margin (em)",
-                                   EPUB_MARGIN_DEFAULTS["hmargin"])
-    return m
-
-
 def build_text_pdf(paragraphs, output, fmt=None, book=None):
     """Lay the cleaned paragraphs out on standard pages, styling headings
     and italics to match the source. With `book` info, prepend a cover
@@ -1996,9 +2016,15 @@ def parse_args():
                         "ended; the wait grows with each attempt (default 3)")
     p.add_argument("--lang", default="eng",
                    help="Tesseract language code(s), e.g. eng, deu, eng+fra")
-    p.add_argument("--min-confidence", type=float, default=55, metavar="N",
+    p.add_argument("--min-confidence", type=float, default=None, metavar="N",
                    help="drop paragraphs whose mean OCR confidence is below "
                         "N (default 55; lower keeps more marginal text)")
+    p.add_argument("--h1-ratio", type=float, default=None, metavar="X",
+                   help="centered text at least X times the body size "
+                        "becomes a chapter title (default 1.8)")
+    p.add_argument("--h2-ratio", type=float, default=None, metavar="X",
+                   help="centered text at least X times the body size "
+                        "becomes a subheading (default 1.35)")
     p.add_argument("--save-text", metavar="FILE",
                    help="also write the OCR text to FILE (text/searchable modes)")
     p.add_argument("--save-images", metavar="DIR",
@@ -2078,14 +2104,19 @@ def main():
     else:
         print(f"Capturing up to {args.pages} pages.")
 
-    # --- book details, output format, formatting (text mode only) ------------
+    # --- book details and settings (text mode only) --------------------------
     book = resolve_book_info(args) if args.mode == "text" else None
-    out_format = resolve_format(args)
+    if args.mode == "text":
+        settings = resolve_settings(args)
+    else:
+        settings = {"format": "pdf", "pdf": dict(FORMAT_DEFAULTS),
+                    "epub": dict(EPUB_MARGIN_DEFAULTS), "min_conf": 55,
+                    **HEADING_DEFAULTS}
+    out_format = settings["format"]
     want_pdf = out_format in ("pdf", "both")
     want_epub = args.mode == "text" and out_format in ("epub", "both")
-    fmt = (resolve_formatting(args)
-           if args.mode == "text" and want_pdf else None)
-    epub_margins = resolve_epub_margins(args) if want_epub else None
+    fmt = settings["pdf"] if want_pdf else None
+    epub_margins = settings["epub"] if want_epub else None
     args.output = resolve_output_path(args, book)
     epub_output = resolve_output_path(args, book, "epub") if want_epub else None
     for path, wanted in ((args.output, want_pdf), (epub_output, want_epub)):
@@ -2111,7 +2142,8 @@ def main():
                 f.write("\n\n\f\n\n".join(texts))
             print(f"Text written to {args.save_text}")
     elif args.mode == "text":
-        pages = extract_structured(images, args.lang, args.min_confidence)
+        pages = extract_structured(images, args.lang, settings["min_conf"],
+                                   settings["h1_ratio"], settings["h2_ratio"])
         pages = strip_headers_footers(pages)
         paragraphs = reflow_paragraphs(pages, args.keep_page_breaks)
         if want_pdf:

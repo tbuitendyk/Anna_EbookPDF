@@ -75,14 +75,16 @@ keystrokes. To abort mid-capture, slam the mouse into any screen corner
 | `searchable` | Page images with an invisible OCR text layer — looks identical to the source, but text is selectable/searchable. |
 | `image`      | Page images only, no OCR.                                               |
 
-In text mode you are offered the formatting defaults (A4 portrait, 11 pt font,
-1.4 line spacing, 2.5 cm margins) — press Enter to accept, or enter `1` to
-customize page size, orientation, font size, line spacing, and margins. Pass
-`--defaults` (or any formatting flag) to skip the prompt in scripted runs.
+In text mode all conversion settings are offered as a single summary —
+output format, PDF layout (page size, orientation, font size, line spacing,
+margins), EPUB margins, the OCR confidence filter, and the heading-detection
+sizes. Press Enter to proceed with the defaults, or enter `1` to walk through
+them (only the sections relevant to the chosen format are asked). Pass
+`--defaults` (or any setting flag) to skip the prompt in scripted runs.
 
-Text mode can produce a **PDF, an EPUB, or both** — choose at the prompt
-(`Output format: [1] PDF [2] EPUB [3] Both`), with `--format pdf|epub|both`,
-or set `"format"` in the config file. The EPUB carries the same structure as
+Text mode can produce a **PDF, an EPUB, or both** — set at the settings
+prompt, with `--format pdf|epub|both`, or via `"format"` in the config
+file. The EPUB carries the same structure as
 the PDF: cover, title page, chapters with headings kept, italics, centered
 poem/epigraph lines, a navigation table of contents, and
 title/author/series metadata (Calibre-compatible series tags).
@@ -99,9 +101,12 @@ flags (`--title`, `--author`, `--series`, `--cover`, `--dest`) or
 The EPUB stylesheet declares page margins several ways (`@page` margins,
 `body` padding, and a top offset on each chapter) so the text doesn't sit
 flush against the top of the screen — readers differ in which declaration
-they honor, so all are included. The margins are offered at setup like the
-other formatting (Enter accepts 1.4 em top/bottom and 0.4 em sides, `1`
-customizes) and can be set with `--epub-vmargin` / `--epub-hmargin`.
+they honor, so all are included. Set them at the settings prompt or with
+`--epub-vmargin` / `--epub-hmargin`. Heading detection is adjustable the
+same way: centered text at least `--h1-ratio` (default 1.8) times the body
+size becomes a chapter title, at least `--h2-ratio` (default 1.35) a
+subheading — raise them if a book's decorated text keeps being mistaken
+for headings.
 
 ## Editing an existing book
 
@@ -140,8 +145,8 @@ A config file next to the script stores your defaults:
 
 - `dest` — default destination folder, offered at the prompt (Enter accepts)
   and used automatically in `--defaults`/flag runs.
-- `cover_dir` — the newest image in this folder is offered as the default
-  cover (Enter accepts, `none` skips, or type another path).
+- `cover_dir` — the newest image in this folder is offered as a one-key
+  choice at the cover prompt (Enter = no cover, `1` = newest, or a path).
 - `authors` / `series` — remembered names shown as numbered lists at the
   prompts; pick by number or type a new name. New names are saved back
   automatically. Picking a series also asks for the book number in the
