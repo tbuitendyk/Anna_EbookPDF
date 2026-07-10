@@ -99,7 +99,9 @@ flags (`--title`, `--author`, `--series`, `--cover`, `--dest`) or
 The EPUB stylesheet declares page margins several ways (`@page` margins,
 `body` padding, and a top offset on each chapter) so the text doesn't sit
 flush against the top of the screen — readers differ in which declaration
-they honor, so all are included.
+they honor, so all are included. The margins are offered at setup like the
+other formatting (Enter accepts 1.4 em top/bottom and 0.4 em sides, `1`
+customizes) and can be set with `--epub-vmargin` / `--epub-hmargin`.
 
 ## Editing an existing book
 
@@ -110,10 +112,13 @@ python ebook2pdf.py --edit "C:\Books\My Great Book.pdf"
 
 Lists the book's chapters and offers, for **EPUB**: remove a chapter's
 heading (its text merges into the previous section — for headings that were
-detected by mistake) or delete a section entirely. For **PDF**: remove pages
-by number/range (`3,5-7`) or remove a whole chapter's pages (from its
-bookmark to the next chapter). Changes are saved to `<name>-edited.epub/pdf`
-by default; enter a path (including the original) to override.
+detected by mistake), delete a section entirely, or fix the page margins —
+the margin rules are written into the book's stylesheet, replacing any
+margins this tool set before, so older EPUBs can be repaired in place. For
+**PDF**: remove pages by number/range (`3,5-7`) or remove a whole chapter's
+pages (from its bookmark to the next chapter). Changes are saved to
+`<name>-edited.epub/pdf` by default; enter a path (including the original)
+to override.
 
 ## Personal defaults (`ebook2pdf_config.json`)
 

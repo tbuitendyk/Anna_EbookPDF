@@ -1155,13 +1155,27 @@ EPUB_LANG = {"eng": "en", "deu": "de", "fra": "fr", "spa": "es", "ita": "it",
              "por": "pt", "nld": "nl", "pol": "pl", "swe": "sv", "dan": "da",
              "nor": "no", "fin": "fi", "rus": "ru", "ces": "cs", "cym": "cy"}
 
+EPUB_MARGIN_DEFAULTS = {"vmargin": 1.4, "hmargin": 0.4}
+_MARGIN_START = "/* ebook2pdf margins */"
+_MARGIN_END = "/* end ebook2pdf margins */"
+_MARGIN_BLOCK_RE = re.compile(
+    re.escape(_MARGIN_START) + r".*?" + re.escape(_MARGIN_END) + r"\s*",
+    re.S)
+
+
+def _epub_margin_css(vmargin=1.4, hmargin=0.4):
+    """Page-edge breathing room, declared several ways because readers
+    vary in what they honor: @page margins (ADE, Kobo), body padding
+    (most webviews), or neither (older Kindle)."""
+    return (f"{_MARGIN_START}\n"
+            f"@page {{ margin: {vmargin:g}em {hmargin:g}em; }}\n"
+            f"body {{ margin: 0; padding: {vmargin:g}em {hmargin:g}em; }}\n"
+            f"div.chapter {{ margin-top: {vmargin * 1.6:g}em; }}\n"
+            f"{_MARGIN_END}\n")
+
+
 EPUB_CSS = """\
-/* Breathing room at the page edges. Readers vary in what they honor:
-   @page margins (ADE, Kobo), body padding (many), or neither (older
-   Kindle) — declaring all is harmless where ignored. */
-@page { margin: 1.4em 0.6em; }
-body { font-family: serif; margin: 0; padding: 1.4em 0.4em; }
-div.chapter { margin-top: 2.2em; }
+body { font-family: serif; }
 p { text-align: justify; margin: 0 0 0.5em 0; }
 p.center { text-align: center; }
 p.label { font-weight: bold; margin: 2em 0 1em 0; }
@@ -1179,7 +1193,7 @@ div.titlepage p.author { font-style: italic; font-size: 1.2em;
 """
 
 
-def build_epub(paragraphs, output, book=None, lang="eng"):
+def build_epub(paragraphs, output, book=None, lang="eng", margins=None):
     """Assemble the structured paragraphs into an EPUB: metadata, cover,
     title page, one XHTML file per chapter, embedded pictures, and a
     navigation table of contents."""
@@ -1216,8 +1230,10 @@ def build_epub(paragraphs, output, book=None, lang="eng"):
         else:
             print(f"Cover image not found, skipping: {cover}")
 
+    css_text = (_epub_margin_css(**{**EPUB_MARGIN_DEFAULTS, **(margins or {})})
+                + EPUB_CSS)
     css = epub.EpubItem(uid="style", file_name="style/main.css",
-                        media_type="text/css", content=EPUB_CSS)
+                        media_type="text/css", content=css_text)
     bk.add_item(css)
 
     # split the flow into chapters at the detected chapter openings
@@ -1401,6 +1417,7 @@ def edit_epub(path):
             print(f"  [{i:2d}] {name[:70]}")
         print("Options: 1 = remove a chapter's heading (its text merges into"
               " the previous section)\n         2 = delete a section entirely"
+              "\n         3 = fix page margins"
               "\n         s = save and exit, q = quit without saving")
         choice = input("Choice: ").strip().lower()
         if choice == "q":
@@ -1408,6 +1425,34 @@ def edit_epub(path):
             return
         if choice == "s":
             break
+        if choice == "3":
+            v = _ask_number("Top/bottom margin (em)",
+                            EPUB_MARGIN_DEFAULTS["vmargin"])
+            h = _ask_number("Side margin (em)",
+                            EPUB_MARGIN_DEFAULTS["hmargin"])
+            block = _epub_margin_css(v, h)
+            css_items = [item for item in bk.get_items()
+                         if item.get_type() == ebooklib.ITEM_STYLE]
+            if css_items:
+                # margin declarations appended last win the cascade; an
+                # earlier ebook2pdf margin block is replaced, not stacked
+                for item in css_items:
+                    text = item.get_content()
+                    text = text.decode("utf-8", "ignore") \
+                        if isinstance(text, bytes) else text
+                    text = _MARGIN_BLOCK_RE.sub("", text)
+                    item.content = text.rstrip() + "\n\n" + block
+            else:
+                sheet = epub.EpubItem(
+                    uid="ebook2pdf_style", file_name="style/ebook2pdf.css",
+                    media_type="text/css", content=block)
+                bk.add_item(sheet)
+                for item, _ in sections():
+                    item.add_link(href="style/ebook2pdf.css",
+                                  rel="stylesheet", type="text/css")
+            changed = True
+            print(f"Margins set to {v:g} em top/bottom, {h:g} em sides.")
+            continue
         if choice not in ("1", "2"):
             continue
         raw = input("Section number: ").strip()
@@ -1584,6 +1629,23 @@ def _chapter_starts(paragraphs):
             chapters.append((i, " — ".join(parts)))
         prev = kind
     return chapters
+
+
+def resolve_epub_margins(args):
+    """EPUB page-edge margins (em). Flags or --defaults skip the prompt."""
+    explicit = {"vmargin": args.epub_vmargin, "hmargin": args.epub_hmargin}
+    if args.defaults or any(v is not None for v in explicit.values()):
+        return {k: v if v is not None else EPUB_MARGIN_DEFAULTS[k]
+                for k, v in explicit.items()}
+    m = dict(EPUB_MARGIN_DEFAULTS)
+    print(f"\nEPUB margins: {m['vmargin']:g} em top/bottom, "
+          f"{m['hmargin']:g} em sides")
+    if input("Press Enter to use these, or 1 to customize: ").strip() == "1":
+        m["vmargin"] = _ask_number("Top/bottom margin (em)",
+                                   EPUB_MARGIN_DEFAULTS["vmargin"])
+        m["hmargin"] = _ask_number("Side margin (em)",
+                                   EPUB_MARGIN_DEFAULTS["hmargin"])
+    return m
 
 
 def build_text_pdf(paragraphs, output, fmt=None, book=None):
@@ -1817,6 +1879,10 @@ def parse_args():
                         "text mode (default 1.4)")
     p.add_argument("--margin", type=float, default=None,
                    help="page margin in cm for text mode (default 2.5)")
+    p.add_argument("--epub-vmargin", type=float, default=None, metavar="EM",
+                   help="EPUB top/bottom page margin in em (default 1.4)")
+    p.add_argument("--epub-hmargin", type=float, default=None, metavar="EM",
+                   help="EPUB side page margin in em (default 0.4)")
     p.add_argument("--defaults", action="store_true",
                    help="use default formatting without prompting")
     p.add_argument("--keep-page-breaks", action="store_true",
@@ -1929,6 +1995,7 @@ def main():
     want_epub = args.mode == "text" and out_format in ("epub", "both")
     fmt = (resolve_formatting(args)
            if args.mode == "text" and want_pdf else None)
+    epub_margins = resolve_epub_margins(args) if want_epub else None
     args.output = resolve_output_path(args, book)
     epub_output = resolve_output_path(args, book, "epub") if want_epub else None
     for path, wanted in ((args.output, want_pdf), (epub_output, want_epub)):
@@ -1960,7 +2027,7 @@ def main():
         if want_pdf:
             build_text_pdf(paragraphs, args.output, fmt, book)
         if want_epub:
-            build_epub(paragraphs, epub_output, book, args.lang)
+            build_epub(paragraphs, epub_output, book, args.lang, epub_margins)
             size_kb = os.path.getsize(epub_output) / 1024
             print(f"Done: {epub_output} ({size_kb:.0f} KB)")
         if not want_pdf:
