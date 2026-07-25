@@ -43,7 +43,10 @@ import io
 import json
 import os
 import re
+import shlex
+import subprocess
 import sys
+import tempfile
 import time
 from collections import Counter
 
@@ -1423,6 +1426,77 @@ def _render_cover_page(image_path, width, height):
     return buf
 
 
+_EDIT_NOTE = """<!-- Edit the text between the tags. Keep the tags
+     (<p>, <h1>, <h2>, <i>) as they are. Save the file and close the
+     editor window to apply the changes. -->
+
+"""
+
+
+def _open_in_editor(path):
+    """Open `path` in the user's editor and wait for it to close."""
+    editor = os.environ.get("VISUAL") or os.environ.get("EDITOR")
+    if not editor:
+        editor = "notepad" if sys.platform == "win32" else "nano"
+    try:
+        subprocess.call(shlex.split(editor) + [path])
+        return True
+    except OSError as exc:
+        print(f"Could not launch editor ({editor}): {exc}")
+        return False
+
+
+def _edit_html_in_editor(inner, title):
+    """Round-trip a chapter's inner HTML through the user's editor.
+    Returns the edited HTML, or None if unchanged/failed."""
+    pretty = re.sub(r">\s*<", ">\n\n<", inner.strip())
+    fd, tmp = tempfile.mkstemp(suffix=".html", prefix="ebook2pdf_")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(_EDIT_NOTE + pretty)
+        print(f"Opening '{title}' in your editor "
+              "(set the EDITOR environment variable to change it)...")
+        if not _open_in_editor(tmp):
+            return None
+        with open(tmp, encoding="utf-8") as f:
+            edited = f.read()
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+    edited = re.sub(r"<!--.*?-->\s*", "", edited, count=1, flags=re.S).strip()
+    if not edited or edited == pretty:
+        return None
+    return edited
+
+
+_HEADING_EL_RE = re.compile(
+    r"<(h[12])([^>]*)>(.*?)</\1>"
+    r"|<p([^>]*class=\"[^\"]*label[^\"]*\"[^>]*)>(.*?)</p>", re.S)
+
+
+def _replace_heading_text(inner, new_text):
+    """Replace the text of the chapter's main heading element — the first
+    heading that isn't just a chapter number, else the first heading.
+    Returns (new_inner, old_text) or (None, None) if no heading exists."""
+    matches = list(_HEADING_EL_RE.finditer(inner))
+    if not matches:
+        return None, None
+    def text_of(m):
+        return re.sub(r"<[^>]+>", "", m.group(3) or m.group(5) or "").strip()
+    target = next((m for m in matches
+                   if not re.fullmatch(r"\d{1,4}|[IVXLCDM]{1,8}",
+                                       text_of(m), re.I)), matches[0])
+    old = text_of(target)
+    if target.group(1):  # h1/h2
+        repl = (f"<{target.group(1)}{target.group(2)}>"
+                f"{_esc(new_text)}</{target.group(1)}>")
+    else:  # label paragraph
+        repl = f"<p{target.group(4)}>{_esc(new_text)}</p>"
+    return inner[:target.start()] + repl + inner[target.end():], old
+
+
 def _ask_save_path(path):
     stem, ext = os.path.splitext(path)
     default = f"{stem}-edited{ext}"
@@ -1476,6 +1550,8 @@ def edit_epub(path):
               "\n         3 = fix page margins"
               "\n         4 = change the cover image"
               "\n         5 = add a chapter heading (splits a section)"
+              "\n         6 = edit a chapter's text"
+              "\n         7 = edit a chapter heading"
               "\n         s = save and exit, q = quit without saving")
         choice = input("Choice: ").strip().lower()
         if choice == "q":
@@ -1483,6 +1559,48 @@ def edit_epub(path):
             return
         if choice == "s":
             break
+        if choice in ("6", "7"):
+            raw = input("Section number: ").strip()
+            if not raw.isdigit() or not 1 <= int(raw) <= len(secs):
+                print("Invalid section number.")
+                continue
+            item, name = secs[int(raw) - 1]
+            inner, wrapped = _unwrap_chapter_div(
+                _body_inner(item.get_content()))
+            if choice == "6":
+                edited = _edit_html_in_editor(inner, name)
+                if edited is None:
+                    print("No changes made.")
+                    continue
+                item.content = (f'<div class="chapter">{edited}</div>'
+                                if wrapped else edited)
+                changed = True
+                print(f"Updated text of: {name}")
+                continue
+            new_inner, old = _replace_heading_text(
+                inner, "?")  # probe for the current heading text
+            if old is None:
+                print("That section has no heading — use option 5 to "
+                      "add one.")
+                continue
+            new_text = input(f"New heading text [{old}]: ").strip()
+            if not new_text:
+                print("No changes made.")
+                continue
+            new_inner, _ = _replace_heading_text(inner, new_text)
+            item.content = (f'<div class="chapter">{new_inner}</div>'
+                            if wrapped else new_inner)
+            for link in _flatten_toc_links(bk.toc):
+                if (getattr(link, "href", "").split("#")[0]
+                        == item.file_name):
+                    try:
+                        link.title = new_text
+                    except AttributeError:
+                        pass
+            titles[item.file_name] = new_text
+            changed = True
+            print(f"Heading changed: {old} -> {new_text}")
+            continue
         if choice == "5":
             raw = input("Section holding the text where the new chapter "
                         "starts: ").strip()
@@ -1678,6 +1796,7 @@ def edit_pdf(path):
     removed = set()
     new_cover = None  # (mode, image path); mode: "replace" | "insert"
     added_marks = []  # (title, zero-based page)
+    renamed = False
     while True:
         print(f"\n{os.path.basename(path)} — {total} pages"
               + (f", {len(removed)} marked for removal" if removed else "")
@@ -1695,6 +1814,7 @@ def edit_pdf(path):
               "chapter)\n"
               "         3 = change the cover page\n"
               "         4 = add a chapter bookmark (title + page)\n"
+              "         5 = rename a chapter bookmark\n"
               "         u = undo all changes\n"
               "         s = save and exit, q = quit without saving")
         choice = input("Choice: ").strip().lower()
@@ -1716,6 +1836,19 @@ def edit_pdf(path):
                 print(f"Bookmark '{title}' at page {raw}.")
             else:
                 print("Need a title and a valid page number.")
+            continue
+        if choice == "5" and chapters:
+            raw = input("Chapter number: ").strip()
+            if raw.isdigit() and 1 <= int(raw) <= len(chapters):
+                k = int(raw) - 1
+                old, page0 = chapters[k]
+                new = input(f"New title [{old}]: ").strip()
+                if new:
+                    chapters[k] = (new, page0)
+                    renamed = True
+                    print(f"Renamed: {old} -> {new}")
+            else:
+                print("Invalid chapter number.")
             continue
         if choice == "3":
             cover_path = _ask_cover_path()
@@ -1746,7 +1879,7 @@ def edit_pdf(path):
             else:
                 print("Invalid chapter number.")
 
-    if not removed and not new_cover and not added_marks:
+    if not removed and not new_cover and not added_marks and not renamed:
         print("Nothing changed.")
         return
     keep = [i for i in range(total) if i not in removed]
@@ -1761,15 +1894,17 @@ def edit_pdf(path):
                                        float(box.width), float(box.height))
         writer.append(PdfReader(cover_buf))
     try:
-        writer.append(reader, pages=keep)
+        # a rename means the outline is rebuilt from scratch below
+        writer.append(reader, pages=keep, import_outline=not renamed)
     except Exception:
         for i in keep:
             writer.add_page(reader.pages[i])
     offset = 1 if new_cover else 0
-    for title, page0 in added_marks:
+    rebuild = list(chapters) if renamed else []
+    for title, page0 in rebuild + added_marks:
         if page0 in keep:
             writer.add_outline_item(title, keep.index(page0) + offset)
-        else:
+        elif (title, page0) in added_marks:
             print(f"Skipping bookmark '{title}': its page was removed.")
     out = _ask_save_path(path)
     with open(out, "wb") as f:
