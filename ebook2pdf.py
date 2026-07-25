@@ -468,8 +468,38 @@ MIN_WORD_CONF = 20
 HEADING_DEFAULTS = {"h1_ratio": 1.8, "h2_ratio": 1.35}
 
 
+def _rescue_drop_cap(img, para, col_left, lang):
+    """A chapter's first paragraph starting lowercase lost its decorative
+    capital: full-page OCR discards glyphs that far outside normal text
+    proportions. The cap sits in the gap left of the paragraph's indented
+    first lines — re-OCR just that box in single-character mode (psm 10),
+    which reads what page mode gave up on. Returns the letter or ''."""
+    import pytesseract
+
+    lh = para.get("_lineh", 0)
+    if lh <= 0:
+        return ""
+    x1 = para.get("_first_left", 0)
+    x0 = max(0, int(col_left - lh * 0.5))
+    if x1 - x0 < lh * 0.8:  # no room for a cap in the gap
+        return ""
+    y0 = max(0, int(para.get("_first_top", 0) - lh * 0.6))
+    y1 = min(img.height, int(para.get("_first_top", 0) + lh * 3.2))
+    crop = img.crop((x0, y0, int(x1), y1))
+    if crop.width < 8 or crop.height < 8:
+        return ""
+    crop = crop.resize((crop.width * 2, crop.height * 2), Image.LANCZOS)
+    try:
+        text = pytesseract.image_to_string(crop, lang=lang,
+                                           config="--psm 10")
+    except Exception:
+        return ""
+    letters = [c for c in text if c.isalpha()]
+    return letters[0].upper() if letters else ""
+
+
 def extract_structured(images, lang, min_conf=55, h1_ratio=1.8,
-                       h2_ratio=1.35):
+                       h2_ratio=1.35, dropcap_report=None):
     """OCR every page with word geometry and return, per page, a list of
     paragraph dicts: {"kind": "h1"|"h2"|"body", "plain": ..., "markup": ...}.
 
@@ -503,7 +533,8 @@ def extract_structured(images, lang, min_conf=55, h1_ratio=1.8,
     body_height = statistics.median(heights) if heights else 20
 
     pages = []
-    for img, d in zip(images, datas):
+    prev_page_end = None
+    for page_no, (img, d) in enumerate(zip(images, datas), 1):
         paras = {}  # (block, par) -> {line_num: [word indices]}
         for j in range(len(d["text"])):
             text_j = d["text"][j].strip()
@@ -647,6 +678,10 @@ def extract_structured(images, lang, min_conf=55, h1_ratio=1.8,
                     "_top": min(r["top"] for r in seg),
                     "_bottom": max(r["bottom"] for r in seg),
                     "_maxh": max(r["maxh"] for r in seg),
+                    "_first_left": seg[0]["left"],
+                    "_first_top": seg[0]["top"],
+                    "_lineh": (statistics.median(seg[0]["heights"])
+                               if seg[0]["heights"] else seg[0]["maxh"]),
                 })
 
         page_paras.sort(key=lambda p: p["_top"])
@@ -778,9 +813,33 @@ def extract_structured(images, lang, min_conf=55, h1_ratio=1.8,
                 p["plain"] = p["markup"] = ""  # dropped below
 
         page_paras = [p for p in page_paras if p["plain"]]
+
+        # a body paragraph starting lowercase right after a heading lost
+        # its drop cap — try a targeted single-character re-OCR of the gap
+        # left of its first lines; report whatever cannot be recovered
+        body_lefts = [q["_left"] for q in page_paras if q["kind"] == "body"]
+        col_left = min(body_lefts) if body_lefts else 0
+        for idx, p in enumerate(page_paras):
+            if (p["kind"] != "body" or not p["plain"]
+                    or not p["plain"][0].islower()):
+                continue
+            before = page_paras[idx - 1]["kind"] if idx else prev_page_end
+            if before not in ("h1", "h2", "label"):
+                continue
+            letter = _rescue_drop_cap(img, p, col_left, lang)
+            if letter:
+                p["plain"] = letter + p["plain"]
+                p["markup"] = _esc(letter) + p["markup"]
+            if dropcap_report is not None:
+                dropcap_report.append({
+                    "page": page_no, "fixed": bool(letter),
+                    "letter": letter, "preview": p["plain"][:60],
+                })
+        prev_page_end = page_paras[-1]["kind"] if page_paras else prev_page_end
         for p in page_paras:
             for key in ("_top", "_bottom", "_ratio", "_left", "_right",
-                        "_centered", "_maxh"):
+                        "_centered", "_maxh", "_first_left", "_first_top",
+                        "_lineh"):
                 p.pop(key, None)
         pages.append(page_paras)
     return pages
@@ -2366,8 +2425,10 @@ def main():
                 f.write("\n\n\f\n\n".join(texts))
             print(f"Text written to {args.save_text}")
     elif args.mode == "text":
+        dropcap_report = []
         pages = extract_structured(images, args.lang, settings["min_conf"],
-                                   settings["h1_ratio"], settings["h2_ratio"])
+                                   settings["h1_ratio"], settings["h2_ratio"],
+                                   dropcap_report)
         pages = strip_headers_footers(pages)
         paragraphs = reflow_paragraphs(pages, args.keep_page_breaks)
         if want_pdf:
@@ -2378,6 +2439,17 @@ def main():
             print(f"Done: {epub_output} ({size_kb:.0f} KB)")
         if not want_pdf:
             args.output = None  # skip the PDF size line below
+        fixed = [r for r in dropcap_report if r["fixed"]]
+        missing = [r for r in dropcap_report if not r["fixed"]]
+        if fixed:
+            print(f"Recovered {len(fixed)} chapter-opening letter(s): "
+                  + ", ".join(f"'{r['letter']}' (page {r['page']})"
+                              for r in fixed))
+        if missing:
+            print("These chapter openings may be missing their first "
+                  "letter — fix with --edit:")
+            for r in missing:
+                print(f"  page {r['page']}: {r['preview']}...")
         if args.save_text:
             with open(args.save_text, "w", encoding="utf-8") as f:
                 f.write("\n\n".join(p["plain"] for p in paragraphs
