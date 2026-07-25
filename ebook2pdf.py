@@ -1147,8 +1147,12 @@ p.center { text-align: center; }
 p.label { font-weight: bold; margin: 2em 0 1em 0; }
 p.label.right { text-align: right; }
 p.label.center { text-align: center; }
-h1 { text-align: center; margin: 1.5em 0 1em 0; }
-h2 { text-align: center; margin: 1em 0 0.8em 0; }
+h1 { text-align: center; font-weight: bold; font-size: 1.6em;
+     margin: 1.5em 0 1em 0; }
+h2 { text-align: center; font-weight: bold; font-size: 1.3em;
+     margin: 1em 0 0.8em 0; }
+h3 { text-align: center; font-weight: bold; font-size: 1.1em;
+     margin: 0.9em 0 0.7em 0; }
 div.pic { text-align: center; margin: 1em 0; }
 div.pic img { max-width: 100%; }
 div.titlepage { text-align: center; margin-top: 18%; }
@@ -1277,7 +1281,7 @@ def _body_inner(content):
 
 
 _LEADING_HEADING_RE = re.compile(
-    r'^\s*(<h[12][^>]*>.*?</h[12]>|<p[^>]*class="[^"]*label[^"]*"[^>]*>.*?</p>'
+    r'^\s*(<h[123][^>]*>.*?</h[123]>|<p[^>]*class="[^"]*label[^"]*"[^>]*>.*?</p>'
     r'|<p[^>]*class="running"[^>]*>.*?</p>)\s*', re.S)
 _RUNNING_RE = re.compile(r'<p[^>]*class="running"[^>]*>.*?</p>\s*', re.S)
 
@@ -1308,7 +1312,7 @@ def _split_blocks(html):
 
 
 def _first_heading_text(html):
-    m = re.search(r"<h[12][^>]*>(.*?)</h[12]>", html, re.S)
+    m = re.search(r"<h[123][^>]*>(.*?)</h[123]>", html, re.S)
     if m:
         return re.sub(r"<[^>]+>", "", m.group(1)).strip()
     return ""
@@ -1472,14 +1476,15 @@ def _edit_html_in_editor(inner, title):
 
 
 _HEADING_EL_RE = re.compile(
-    r"<(h[12])([^>]*)>(.*?)</\1>"
+    r"<(h[123])([^>]*)>(.*?)</\1>"
     r"|<p([^>]*class=\"[^\"]*label[^\"]*\"[^>]*)>(.*?)</p>", re.S)
 
 
-def _replace_heading_text(inner, new_text):
-    """Replace the text of the chapter's main heading element — the first
-    heading that isn't just a chapter number, else the first heading.
-    Returns (new_inner, old_text) or (None, None) if no heading exists."""
+def _replace_heading_text(inner, new_text, new_tag=None):
+    """Replace the text (and optionally the level tag) of the chapter's
+    main heading element — the first heading that isn't just a chapter
+    number, else the first heading. Returns (new_inner, old_text) or
+    (None, None) if no heading exists."""
     matches = list(_HEADING_EL_RE.finditer(inner))
     if not matches:
         return None, None
@@ -1489,12 +1494,31 @@ def _replace_heading_text(inner, new_text):
                    if not re.fullmatch(r"\d{1,4}|[IVXLCDM]{1,8}",
                                        text_of(m), re.I)), matches[0])
     old = text_of(target)
-    if target.group(1):  # h1/h2
-        repl = (f"<{target.group(1)}{target.group(2)}>"
-                f"{_esc(new_text)}</{target.group(1)}>")
-    else:  # label paragraph
+    if target.group(1):  # h1/h2/h3
+        tag = new_tag or target.group(1)
+        attrs = target.group(2) if not new_tag else ""
+        repl = f"<{tag}{attrs}>{_esc(new_text)}</{tag}>"
+    elif new_tag:  # label paragraph promoted to a heading level
+        repl = f"<{new_tag}>{_esc(new_text)}</{new_tag}>"
+    else:
         repl = f"<p{target.group(4)}>{_esc(new_text)}</p>"
     return inner[:target.start()] + repl + inner[target.end():], old
+
+
+_HEADING_LEVELS = {"1": "h1", "2": "h2", "3": "h3"}
+
+
+def _ask_heading_level(allow_keep=False):
+    keep = "[Enter] keep  " if allow_keep else ""
+    default = None if allow_keep else "h1"
+    while True:
+        raw = input(f"Level: {keep}[1] Main  [2] Sub 1  [3] Sub 2"
+                    f"{'' if allow_keep else '  [1]'}: ").strip()
+        if not raw:
+            return default
+        if raw in _HEADING_LEVELS:
+            return _HEADING_LEVELS[raw]
+        print("Enter 1, 2, or 3.")
 
 
 def _ask_save_path(path):
@@ -1583,23 +1607,28 @@ def edit_epub(path):
                 print("That section has no heading — use option 5 to "
                       "add one.")
                 continue
-            new_text = input(f"New heading text [{old}]: ").strip()
-            if not new_text:
+            new_text = input(f"New heading text [{old}] "
+                             "(Enter to keep): ").strip()
+            new_tag = _ask_heading_level(allow_keep=True)
+            if not new_text and new_tag is None:
                 print("No changes made.")
                 continue
-            new_inner, _ = _replace_heading_text(inner, new_text)
+            final = new_text or old
+            new_inner, _ = _replace_heading_text(inner, final, new_tag)
             item.content = (f'<div class="chapter">{new_inner}</div>'
                             if wrapped else new_inner)
-            for link in _flatten_toc_links(bk.toc):
-                if (getattr(link, "href", "").split("#")[0]
-                        == item.file_name):
-                    try:
-                        link.title = new_text
-                    except AttributeError:
-                        pass
-            titles[item.file_name] = new_text
+            if new_text:
+                for link in _flatten_toc_links(bk.toc):
+                    if (getattr(link, "href", "").split("#")[0]
+                            == item.file_name):
+                        try:
+                            link.title = new_text
+                        except AttributeError:
+                            pass
+                titles[item.file_name] = new_text
             changed = True
-            print(f"Heading changed: {old} -> {new_text}")
+            print(f"Heading changed: {old} -> {final}"
+                  + (f" ({new_tag})" if new_tag else ""))
             continue
         if choice == "5":
             raw = input("Section holding the text where the new chapter "
@@ -1627,7 +1656,18 @@ def edit_epub(path):
             if not heading:
                 print("No heading given.")
                 continue
+            tag = _ask_heading_level()
             cut = int(raw) - 1
+            if tag != "h1":
+                # sub-headings stay inside the chapter: insert in place,
+                # no section split, no contents entry
+                blocks.insert(cut, f"<{tag}>{_esc(heading)}</{tag}>")
+                new_inner = "\n".join(blocks)
+                item.content = (f'<div class="chapter">{new_inner}</div>'
+                                if wrapped else new_inner)
+                changed = True
+                print(f"Added sub-heading: {heading}")
+                continue
             head_html = "\n".join(blocks[:cut])
             tail_html = f"<h1>{_esc(heading)}</h1>\n" + "\n".join(blocks[cut:])
             if wrapped:
@@ -1988,6 +2028,10 @@ def build_text_pdf(paragraphs, output, fmt=None, book=None):
             "H2", fontName="Times-Bold", fontSize=fs * 1.35,
             leading=fs * 1.35 * 1.2, alignment=TA_CENTER,
             spaceBefore=fs * 1.1, spaceAfter=fs * 0.7),
+        "h3": ParagraphStyle(
+            "H3", fontName="Times-Bold", fontSize=fs * 1.15,
+            leading=fs * 1.15 * 1.2, alignment=TA_CENTER,
+            spaceBefore=fs * 0.9, spaceAfter=fs * 0.6),
     }
     label_align = {"left": TA_LEFT, "center": TA_CENTER, "right": TA_RIGHT}
     for align, ta in label_align.items():

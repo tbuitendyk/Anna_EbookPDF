@@ -121,10 +121,11 @@ detected by mistake), delete a section entirely, fix the page margins — the
 margin rules are written into the book's stylesheet, replacing any margins
 this tool set before, so older EPUBs can be repaired in place — change the
 cover image (replaces the embedded cover; sets one if the book has none),
-add a chapter heading (pick the paragraph where the chapter starts and
-the section is split there with a new heading and contents entry), edit a
-chapter heading's text (updates the contents entry too), or edit a
-chapter's text — the chapter opens in your text editor (Notepad on
+add a chapter heading — pick the paragraph where it starts and its level:
+Main (splits the section and gets a contents entry), Sub 1, or Sub 2
+(inserted inline within the chapter); all three render centered and bold,
+decreasing in size — edit a chapter heading's text and/or level (updates
+the contents entry too), or edit a chapter's text — the chapter opens in your text editor (Notepad on
 Windows, or whatever `EDITOR` is set to); fix the text between the tags,
 save, and close the window to apply. For
 **PDF**: remove pages by number/range (`3,5-7`), remove a whole chapter's
