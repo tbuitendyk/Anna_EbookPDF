@@ -468,16 +468,16 @@ MIN_WORD_CONF = 20
 HEADING_DEFAULTS = {"h1_ratio": 1.8, "h2_ratio": 1.35}
 
 
-def _read_chapter_number(img, first_top, lang):
-    """Try to read a stylized chapter number from the strip above the
-    page's first text: digit/roman-whitelisted single-line OCR over the
-    top-center of the page. Returns the number text or ''."""
+def _read_chapter_number(img, y0, y1, lang):
+    """Try to read a stylized chapter number from a horizontal strip of
+    the page: digit/roman-whitelisted single-line OCR over its center.
+    Returns the number text or ''."""
     import pytesseract
 
-    y1 = int(min(first_top * 0.45, img.height * 0.24))
-    if y1 < 16:
+    y0, y1 = max(0, int(y0)), min(img.height, int(y1))
+    if y1 - y0 < 16:
         return ""
-    crop = img.crop((int(img.width * 0.25), 0, int(img.width * 0.75), y1))
+    crop = img.crop((int(img.width * 0.25), y0, int(img.width * 0.75), y1))
     crop = crop.resize((crop.width * 2, crop.height * 2), Image.LANCZOS)
     try:
         text = pytesseract.image_to_string(
@@ -798,19 +798,27 @@ def extract_structured(images, lang, min_conf=55, h1_ratio=1.8,
                     and not plain.endswith(_TERMINAL)
                     and (plain.isupper() or plain.istitle()))
 
-        for i in range(len(page_paras) - 1):
-            p, q = page_paras[i], page_paras[i + 1]
-            if (p["kind"] in ("body", "h2") and p.get("_centered")
+        for i, p in enumerate(page_paras):
+            plain_num = p["plain"].strip()
+            if not (p["kind"] in ("body", "h2") and p.get("_centered")
                     and re.fullmatch(r"\d{1,4}|[IVXLCDM]{1,8}",
-                                     p["plain"].strip(), re.I)):
-                if q["kind"] in ("h1", "h2", "label"):
-                    p["kind"] = "h1"
-                    p.pop("align", None)
-                elif _title_like(q):
-                    p["kind"] = "h1"
-                    q["kind"] = "h1"
-                    p.pop("align", None)
-                    q.pop("align", None)
+                                     plain_num, re.I)):
+                continue
+            # a single-letter roman numeral inside a centered block is
+            # usually the pronoun "I" in a poem line — leave it alone
+            if (len(plain_num) == 1 and plain_num.isalpha()
+                    and in_centered_run(i)):
+                continue
+            # a number in the bottom strip is a reader page counter,
+            # not a chapter
+            if p.get("_top", 0) > 0.85 * img.height:
+                continue
+            p["kind"] = "h1"
+            p.pop("align", None)
+            q = page_paras[i + 1] if i + 1 < len(page_paras) else None
+            if q is not None and q["kind"] == "body" and _title_like(q):
+                q["kind"] = "h1"
+                q.pop("align", None)
 
         # drop caps: a huge one-to-three-letter "paragraph" is the oversized
         # first letter of the adjacent paragraph — put it back. When the
@@ -845,7 +853,8 @@ def extract_structured(images, lang, min_conf=55, h1_ratio=1.8,
                 and page_paras[0].get("_top", 0) > 0.28 * img.height
                 and prev_page_complete is not False):
             number = _read_chapter_number(
-                img, page_paras[0]["_top"], lang)
+                img, 0, min(page_paras[0]["_top"] * 0.45,
+                            img.height * 0.24), lang)
             heading = number or "* * *"
             page_paras.insert(0, {"kind": "h1", "plain": heading,
                                   "markup": _esc(heading),
@@ -853,6 +862,35 @@ def extract_structured(images, lang, min_conf=55, h1_ratio=1.8,
             if dropcap_report is not None:
                 dropcap_report.append({"type": "chapter", "page": page_no,
                                        "number": number})
+
+        # a lone chapter number mid-page is sometimes discarded entirely
+        # by the OCR engine, leaving only an oversized vertical gap between
+        # the old chapter's completed last paragraph and the new chapter's
+        # first — read the number from the gap strip and break there
+        gap_inserts = []
+        for i in range(len(page_paras) - 1):
+            p, q = page_paras[i], page_paras[i + 1]
+            if (p["kind"] != "body" or q["kind"] != "body"
+                    or not p.get("ends_short")):
+                continue
+            lineh = q.get("_lineh") or p.get("_lineh") or 0
+            gap = q.get("_top", 0) - p.get("_bottom", 0)
+            if lineh <= 0 or gap < 5 * lineh:
+                continue
+            number = _read_chapter_number(
+                img, p["_bottom"] + lineh * 0.5, q["_top"] - lineh * 0.5,
+                lang)
+            if not number and gap < 8 * lineh:
+                continue  # scene break, not a chapter
+            heading = number or "* * *"
+            gap_inserts.append((i + 1, {"kind": "h1", "plain": heading,
+                                        "markup": _esc(heading),
+                                        "ends_short": True}))
+            if dropcap_report is not None:
+                dropcap_report.append({"type": "chapter", "page": page_no,
+                                       "number": number})
+        for pos, para in reversed(gap_inserts):
+            page_paras.insert(pos, para)
 
         # a body paragraph starting lowercase right after a heading lost
         # its drop cap — try a targeted single-character re-OCR of the gap
@@ -914,10 +952,14 @@ def strip_headers_footers(pages):
             near_bottom = i >= len(paras) - EDGE
             if near_edge and _norm_line(plain) in running:
                 continue
-            if any(pat.match(plain) for pat in CHROME_PATTERNS):
-                continue
-            if near_bottom and BARE_NUMBER_PATTERN.match(plain):
-                continue
+            # chrome filters apply to body text only — classified or
+            # inserted headings (a chapter number is a bare number too)
+            # are kept deliberately
+            if p["kind"] == "body":
+                if any(pat.match(plain) for pat in CHROME_PATTERNS):
+                    continue
+                if near_bottom and BARE_NUMBER_PATTERN.match(plain):
+                    continue
             keep.append(p)
         cleaned.append(keep)
     return cleaned
