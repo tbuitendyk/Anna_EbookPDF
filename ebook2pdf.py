@@ -468,6 +468,27 @@ MIN_WORD_CONF = 20
 HEADING_DEFAULTS = {"h1_ratio": 1.8, "h2_ratio": 1.35}
 
 
+def _read_chapter_number(img, first_top, lang):
+    """Try to read a stylized chapter number from the strip above the
+    page's first text: digit/roman-whitelisted single-line OCR over the
+    top-center of the page. Returns the number text or ''."""
+    import pytesseract
+
+    y1 = int(min(first_top * 0.45, img.height * 0.24))
+    if y1 < 16:
+        return ""
+    crop = img.crop((int(img.width * 0.25), 0, int(img.width * 0.75), y1))
+    crop = crop.resize((crop.width * 2, crop.height * 2), Image.LANCZOS)
+    try:
+        text = pytesseract.image_to_string(
+            crop, lang=lang,
+            config="--psm 7 -c tessedit_char_whitelist=0123456789IVXLCDM")
+    except Exception:
+        return ""
+    text = "".join(ch for ch in text if ch.isalnum())
+    return text if text and len(text) <= 4 else ""
+
+
 def _rescue_drop_cap(img, para, col_left, lang):
     """A chapter's first paragraph starting lowercase lost its decorative
     capital: full-page OCR discards glyphs that far outside normal text
@@ -534,6 +555,7 @@ def extract_structured(images, lang, min_conf=55, h1_ratio=1.8,
 
     pages = []
     prev_page_end = None
+    prev_page_complete = None
     for page_no, (img, d) in enumerate(zip(images, datas), 1):
         paras = {}  # (block, par) -> {line_num: [word indices]}
         for j in range(len(d["text"])):
@@ -814,6 +836,24 @@ def extract_structured(images, lang, min_conf=55, h1_ratio=1.8,
 
         page_paras = [p for p in page_paras if p["plain"]]
 
+        # chapter openings whose number is pure artwork (calligraphic
+        # numeral, ornament) leave no heading text at all — the tell is
+        # layout: the page's text starts far down, right after a completed
+        # paragraph. Insert the chapter break, reading the stylized number
+        # from the top strip when possible.
+        if (page_paras and page_paras[0]["kind"] == "body"
+                and page_paras[0].get("_top", 0) > 0.28 * img.height
+                and prev_page_complete is not False):
+            number = _read_chapter_number(
+                img, page_paras[0]["_top"], lang)
+            heading = number or "* * *"
+            page_paras.insert(0, {"kind": "h1", "plain": heading,
+                                  "markup": _esc(heading),
+                                  "ends_short": True})
+            if dropcap_report is not None:
+                dropcap_report.append({"type": "chapter", "page": page_no,
+                                       "number": number})
+
         # a body paragraph starting lowercase right after a heading lost
         # its drop cap — try a targeted single-character re-OCR of the gap
         # left of its first lines; report whatever cannot be recovered
@@ -832,10 +872,15 @@ def extract_structured(images, lang, min_conf=55, h1_ratio=1.8,
                 p["markup"] = _esc(letter) + p["markup"]
             if dropcap_report is not None:
                 dropcap_report.append({
-                    "page": page_no, "fixed": bool(letter),
-                    "letter": letter, "preview": p["plain"][:60],
+                    "type": "dropcap", "page": page_no,
+                    "fixed": bool(letter), "letter": letter,
+                    "preview": p["plain"][:60],
                 })
-        prev_page_end = page_paras[-1]["kind"] if page_paras else prev_page_end
+        if page_paras:
+            last = page_paras[-1]
+            prev_page_end = last["kind"]
+            prev_page_complete = (last["kind"] != "body"
+                                  or last.get("ends_short", False))
         for p in page_paras:
             for key in ("_top", "_bottom", "_ratio", "_left", "_right",
                         "_centered", "_maxh", "_first_left", "_first_top",
@@ -2439,8 +2484,17 @@ def main():
             print(f"Done: {epub_output} ({size_kb:.0f} KB)")
         if not want_pdf:
             args.output = None  # skip the PDF size line below
-        fixed = [r for r in dropcap_report if r["fixed"]]
-        missing = [r for r in dropcap_report if not r["fixed"]]
+        art_chapters = [r for r in dropcap_report
+                        if r.get("type") == "chapter"]
+        if art_chapters:
+            print("Chapter breaks inserted where the number is artwork:")
+            for r in art_chapters:
+                name = (r["number"] if r["number"] else
+                        "* * *  (number unreadable — rename with --edit)")
+                print(f"  page {r['page']}: {name}")
+        drops = [r for r in dropcap_report if r.get("type") == "dropcap"]
+        fixed = [r for r in drops if r["fixed"]]
+        missing = [r for r in drops if not r["fixed"]]
         if fixed:
             print(f"Recovered {len(fixed)} chapter-opening letter(s): "
                   + ", ".join(f"'{r['letter']}' (page {r['page']})"
